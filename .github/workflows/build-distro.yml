@@ -128,5 +128,5 @@ jobs:
             * Shell: poler-sh 0.2.0 (no bash in the image)
             * Updater: poler-update (direct GitHub sync, sha256-verified)
             * ISO: hybrid BIOS+UEFI, boot-verified in QEMU
-          env:
-            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
