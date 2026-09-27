@@ -124,20 +124,51 @@ fn initramfs_stage() -> ! {
     }
     log("switch_root -> /sbin/init (poler-init stage 2)");
 
-    let init = CString::new("/sbin/init").unwrap();
-    let argv = [init.clone(), CString::new("poler-init").unwrap()];
+    // Diagnostics: prove what the new root actually contains before exec.
+    for probe in ["/sbin/init", "/usr/bin/init", "/usr/bin/poler-init",
+                  "/usr/bin/poler-sh", "/lib64/ld-linux-x86-64.so.2",
+                  "/usr/lib/ld-linux-x86-64.so.2"] {
+        let is_link = fs::symlink_metadata(probe)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        match fs::metadata(probe) {
+            Ok(m) => log(format!("probe {} : present ({} bytes, {})", probe, m.len(),
+                                 if is_link { "symlink" } else { "file" }).as_str()),
+            Err(e) => log(format!("probe {} : {} — errno {}", probe, e, e.raw_os_error().unwrap_or(0)).as_str()),
+        }
+    }
+
+    // exec chain with fallbacks — PID 1 handoff must never depend on a
+    // single symlink resolving correctly.
+    for cand in ["/sbin/init", "/usr/bin/init", "/usr/bin/poler-init"] {
+        match exec_as_init(cand) {
+            Ok(()) => unreachable!("execve does not return on success"),
+            Err(errno) => {
+                log(format!("execve({}) failed: errno {} ({})", cand, errno,
+                            std::io::Error::from_raw_os_error(errno)).as_str());
+            }
+        }
+    }
+    emergency_shell("exec init failed");
+}
+
+fn exec_as_init(path: &str) -> Result<(), i32> {
+    let init = CString::new(path).map_err(|_| 22)?;
+    let arg1 = CString::new("poler-init").map_err(|_| 22)?;
+    let argv = [init.clone(), arg1];
     let env = [
         CString::new("HOME=/root").unwrap(),
         CString::new("PATH=/usr/bin:/bin:/usr/sbin:/sbin").unwrap(),
         CString::new("TERM=linux").unwrap(),
     ];
     unsafe {
-        libc::execve(init.as_ptr(), [argv[0].as_ptr(), argv[1].as_ptr(), std::ptr::null()].as_ptr(),
-                     [env[0].as_ptr(), env[1].as_ptr(), env[2].as_ptr(), std::ptr::null()].as_ptr());
+        libc::execve(
+            init.as_ptr(),
+            [argv[0].as_ptr(), argv[1].as_ptr(), std::ptr::null()].as_ptr(),
+            [env[0].as_ptr(), env[1].as_ptr(), env[2].as_ptr(), std::ptr::null()].as_ptr(),
+        );
     }
-    // execve only returns on failure
-    log("\x1b[1;31mFATAL: execve(/sbin/init) failed\x1b[0m");
-    emergency_shell("exec /sbin/init failed");
+    Err(unsafe { *libc::__errno_location() })
 }
 
 fn mount_early_pseudo_fs() {

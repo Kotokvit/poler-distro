@@ -33,7 +33,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 xorriso grub-pc-bin grub-efi-amd64-bin mtools \
             squashfs-tools cpio zstd xz-utils curl ca-certificates \
-            pkg-config libfuse-dev libfuse3-dev
+            pkg-config libfuse-dev libfuse3-dev musl-tools
           echo "--- toolchain check ---"
           qemu-system-x86_64 --version | head -1
           mksquashfs -version 2>&1 | head -1
@@ -42,14 +42,18 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build sovereign poler-init and poler-update
+      - name: Build sovereign poler-init (static musl) and poler-update
         run: |
           set -e
           mkdir -p binaries
-          (cd sovereign/poler-init  && cargo build --release)
+          rustup target add x86_64-unknown-linux-musl
+          # poler-init = PID 1: STATIC musl build — zero interpreter deps in
+          # both the initramfs and the live system.
+          (cd sovereign/poler-init && cargo build --release --target x86_64-unknown-linux-musl)
+          cp sovereign/poler-init/target/x86_64-unknown-linux-musl/release/poler-init binaries/
           (cd sovereign/poler-update && cargo build --release)
-          cp sovereign/poler-init/target/release/poler-init  binaries/
           cp sovereign/poler-update/target/release/poler-update binaries/
+          file binaries/poler-init | grep -q statically || echo "WARN: poler-init not static"
 
       - name: Build poler-sh from Kotokvit/poler-sh
         run: |
