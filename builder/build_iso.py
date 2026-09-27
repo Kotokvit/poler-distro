@@ -294,7 +294,10 @@ def stage_inject_poler(rootfs, bins_dir):
                 print(f"{YELLOW}[skip]{RESET} optional component absent: {name}")
                 continue
             die(f"missing POLER binary: {src} — build the sovereign stack first")
-        d = os.path.join(rootfs, dest)
+        # dest is absolute ("/usr/bin/...") — lstrip is CRITICAL: os.path.join
+        # with a leading slash DISCARDS the rootfs prefix and would inject
+        # into the build host's own /usr/bin instead.
+        d = os.path.join(rootfs, dest.lstrip("/"))
         os.makedirs(os.path.dirname(d), exist_ok=True)
         shutil.copy2(src, d)
         os.chmod(d, 0o755)
@@ -360,9 +363,9 @@ def stage_verification(rootfs, version, kver):
     os.makedirs(os.path.dirname(vfile), exist_ok=True)
 
     binaries = "\n".join(
-        f"  {dest:<22} {os.path.getsize(os.path.join(rootfs, dest)):>10} bytes"
+        f"  {dest:<22} {os.path.getsize(os.path.join(rootfs, dest.lstrip('/'))):>10} bytes"
         for dest in sorted(POLER_BINARIES.values())
-        if os.path.exists(os.path.join(rootfs, dest)))
+        if os.path.exists(os.path.join(rootfs, dest.lstrip("/"))))
 
     content = f"""POLER CACHYOS SOVEREIGN EDITION — BUILD VERIFICATION
 =====================================================
