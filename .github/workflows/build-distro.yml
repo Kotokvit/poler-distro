@@ -99,6 +99,8 @@ jobs:
               --bins binaries \
               --out out \
               --qemu
+          # out/ was produced under sudo — hand it back to the runner user
+          sudo chown -R "$(id -u):$(id -g)" out
 
       - name: Package sovereign core asset for poler-update
         run: |
