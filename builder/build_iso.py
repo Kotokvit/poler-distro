@@ -547,7 +547,7 @@ def stage_iso(work, iso_tree, version, kernel_img):
 
     cfg_dir = os.path.join(iso_tree, "boot/grub")
     os.makedirs(cfg_dir, exist_ok=True)
-    open(os.path.join(cfg_dir, "grub.cfg"), "w").write(GRUB_CFG.format(marker=ISO_MARKER))
+    open(os.path.join(cfg_dir, "grub.cfg"), "w").write(GRUB_CFG.replace("{marker}", ISO_MARKER))
 
     # boot-medium marker (poler-init searches for /poler/live.squashfs)
     open(os.path.join(iso_tree, ISO_MARKER), "w").write("POLER\n")
