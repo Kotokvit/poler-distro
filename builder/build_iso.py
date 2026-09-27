@@ -268,14 +268,21 @@ def stage_purge_legacy(rootfs):
 
     # Sovereign wiring: shell + PID 1.
     for link, target in [("usr/bin/sh", "poler-sh"),
-                         ("usr/bin/bash", "poler-sh"),
-                         ("sbin/init", "../usr/bin/poler-init")]:
+                         ("usr/bin/bash", "poler-sh")]:
         lp = os.path.join(rootfs, link)
         if os.path.lexists(lp):
             os.remove(lp)
         os.symlink(target, lp)
 
-    ok("legacy purged: /bin/sh, /bin/bash -> poler-sh; /sbin/init -> poler-init")
+    # PID 1: with the merged usr layout (sbin -> usr/bin) the canonical
+    # /sbin/init IS /usr/bin/init — creating rootfs/sbin/init would traverse
+    # the sbin symlink and produce a broken link at the wrong place.
+    init_link = os.path.join(rootfs, "usr/bin/init")
+    if os.path.lexists(init_link):
+        os.remove(init_link)
+    os.symlink("poler-init", init_link)
+
+    ok("legacy purged: /bin/sh, /bin/bash -> poler-sh; /sbin/init (=usr/bin/init) -> poler-init")
 
 
 def stage_inject_poler(rootfs, bins_dir):
@@ -382,7 +389,7 @@ mkinitcpio         : PURGED (sovereign poler-initramfs instead)
 pacman             : PURGED (updates arrive via poler-update from GitHub only)
 SysVinit glue      : absent (no /etc/init.d, no rc.local)
 /bin/sh            : symlink -> poler-sh
-/sbin/init         : symlink -> ../usr/bin/poler-init (PID 1)
+/sbin/init         : /usr/bin/init (merged usr layout) -> poler-init (PID 1)
 root shell         : /usr/bin/poler-sh (/etc/passwd)
 
 BOOT CHAIN
