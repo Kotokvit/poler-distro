@@ -427,22 +427,36 @@ def copy_tool_with_libs(rootfs, tool, initrd_dir):
     dst_bin = os.path.join(initrd_dir, "usr/bin", tool)
     os.makedirs(os.path.dirname(dst_bin), exist_ok=True)
     shutil.copy2(src, dst_bin)
-    # ldd closure
-    r = subprocess.run(["ldd", src], capture_output=True, text=True)
+    copy_elf_libs(src, initrd_dir)
+    return True
+
+
+def copy_elf_libs(elf, initrd_dir):
+    """Copy the shared-library closure of an ELF (per ldd) into the
+    initramfs. The dynamic loader (ld-linux) additionally lands in /lib64 —
+    the canonical interpreter path on x86_64."""
+    r = subprocess.run(["ldd", elf], capture_output=True, text=True)
     for line in r.stdout.splitlines():
         line = line.strip()
+        lib = None
         if "=>" in line:
-            lib = line.split("=>")[1].strip().split()[0] if line.split("=>")[1].strip() else None
+            right = line.split("=>", 1)[1].strip()
+            if right and not right.startswith("("):
+                lib = right.split()[0]
         elif line.startswith("/"):
             lib = line.split()[0]
-        else:
-            continue
         if lib and os.path.exists(lib):
-            dst_lib = os.path.join(initrd_dir, "usr/lib", os.path.basename(lib))
-            os.makedirs(os.path.dirname(dst_lib), exist_ok=True)
-            if not os.path.exists(dst_lib):
-                shutil.copy2(lib, dst_lib)
-    return True
+            base = os.path.basename(lib)
+            dst = os.path.join(initrd_dir, "usr/lib", base)
+            if not os.path.exists(dst):
+                shutil.copy2(lib, dst)
+                os.chmod(dst, 0o755)
+            # dynamic loader must also exist at the canonical interp path
+            if base.startswith("ld-linux") or base.startswith("ld64"):
+                dst64 = os.path.join(initrd_dir, "lib64", base)
+                if not os.path.exists(dst64):
+                    shutil.copy2(lib, dst64)
+                    os.chmod(dst64, 0o755)
 
 
 def stage_initramfs(rootfs, bins_dir, iso_tree, kver):
@@ -450,12 +464,19 @@ def stage_initramfs(rootfs, bins_dir, iso_tree, kver):
     if os.path.exists(initrd_dir):
         shutil.rmtree(initrd_dir)
     os.makedirs(os.path.join(initrd_dir, "usr/bin"))
+    os.makedirs(os.path.join(initrd_dir, "usr/lib"))
+    os.makedirs(os.path.join(initrd_dir, "lib64"))
     os.makedirs(os.path.join(initrd_dir, "usr/lib/modules", kver))
 
     # stage-1 PID 1
     shutil.copy2(os.path.join(bins_dir, "poler-init"), os.path.join(initrd_dir, "init"))
     os.chmod(os.path.join(initrd_dir, "init"), 0o755)
     open(os.path.join(initrd_dir, ".poler-initramfs"), "w").write("stage1\n")
+
+    # CRITICAL: /init is a dynamic ELF — its interpreter and libs MUST be
+    # inside the initramfs, otherwise the kernel panics with
+    # "Failed to execute /init (error -2)" (ENOENT on ld-linux).
+    copy_elf_libs(os.path.join(bins_dir, "poler-init"), initrd_dir)
 
     # fallback module decompressors (+ shared libs)
     for tool in ["zstd", "xz"]:
@@ -579,7 +600,7 @@ def stage_qemu(iso_path, timeout_s=240):
         ("boot medium found", "boot medium:" in text),
         ("switch_root executed", "switch_root" in text),
         ("poler-init stage 2 (system)", "sovereign boot stage 2" in text),
-        ("POLER banner on console", "POLER CachyOS Sovereign Edition" in text),
+        ("poler-sh session supervised", "supervising" in text and "poler-sh session" in text),
     ]
     failed = [name for name, passed in checks if not passed]
     for name, passed in checks:

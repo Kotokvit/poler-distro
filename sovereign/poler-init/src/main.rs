@@ -571,11 +571,12 @@ fn system_stage() -> ! {
     banner();
 
     // Signals: SIGINT/SIGTERM/SIGUSR1 -> reboot; SIGUSR2/SIGQUIT -> poweroff.
+    // NOTE: SIGCHLD stays at default — the supervision loop needs wait() to
+    // collect the shell's exit code (42=reboot, 43=poweroff).
     unsafe {
         for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGUSR1, libc::SIGUSR2, libc::SIGQUIT] {
             libc::signal(sig, on_signal as *const () as usize);
         }
-        libc::signal(libc::SIGCHLD, libc::SIG_IGN as usize); // auto-reap unrelated children
     }
 
     // Supervision loop on the console (and extra TTYs when present).
