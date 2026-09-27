@@ -34,27 +34,22 @@ def build_distro():
     for d in dirs:
         os.makedirs(os.path.join(ROOTFS_DIR, d), exist_ok=True)
 
-    # 2. Inject sovereign binaries
-    sovereign_bins = {
+    # 2. Inject core modular binaries only (strict modular separation)
+    core_bins = {
         "/home/vitalij/Стільниця/poler/target/release/poler-init": "bin/poler-init",
         "/home/vitalij/.local/bin/poler-sh": "bin/poler-sh",
-        "/home/vitalij/.local/bin/poler-exec": "bin/poler-exec",
-        "/home/vitalij/.local/bin/poler-engine": "bin/poler-engine",
         "/home/vitalij/.local/bin/poler-box": "bin/poler-box",
         "/home/vitalij/.local/bin/poler-fuse": "bin/poler-fuse",
         "/home/vitalij/.local/bin/poler": "bin/poler",
-        "/home/vitalij/.local/bin/poler-git": "bin/poler-git",
-        "/home/vitalij/.local/bin/poler-mesh": "bin/poler-mesh",
-        "/home/vitalij/.local/bin/poler-edit": "bin/poler-edit",
         "/home/vitalij/.local/bin/poler-update": "bin/poler-update",
     }
 
-    for src, dst in sovereign_bins.items():
+    for src, dst in core_bins.items():
         if os.path.exists(src):
             target = os.path.join(ROOTFS_DIR, dst)
             shutil.copy2(src, target)
             os.chmod(target, 0o755)
-            log(f"Injected sovereign component: {dst}")
+            log(f"Injected core module: {dst}")
 
     # 3. Purge bash & legacy shell: replace with symlinks to poler-sh
     log("Purging legacy 90s GNU/Bash shell...")
