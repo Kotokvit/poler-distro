@@ -20,6 +20,13 @@ jobs:
       - name: Checkout distro repository
         uses: actions/checkout@v4
 
+      - name: Free disk space on the runner
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af 2>/dev/null || true
+          df -h /
+
       - name: Install ISO and QEMU build dependencies
         run: |
           sudo apt-get update -qq
@@ -61,8 +68,8 @@ jobs:
           (cd /tmp/poler && cargo build --release --bin poler --bin poler-box)
           cp /tmp/poler/target/release/poler      binaries/
           cp /tmp/poler/target/release/poler-box  binaries/
-          # poler-fuse needs FUSE dev headers; keep it optional
-          if (cd /tmp/poler && cargo build --release --bin poler-fuse); then
+          # poler-fuse is a workspace crate: build via package selector
+          if (cd /tmp/poler && cargo build --release -p poler-fuse); then
             cp /tmp/poler/target/release/poler-fuse binaries/
           else
             echo "poler-fuse unavailable on this runner - building without it"
@@ -78,6 +85,10 @@ jobs:
       - name: Build the POLER CachyOS x86_64 ISO
         run: |
           set -e
+          # reclaim disk occupied by intermediate cargo builds
+          sudo rm -rf /tmp/poler-sh /tmp/poler sovereign/poler-init/target \
+            sovereign/poler-update/target ~/.cargo/registry/cache || true
+          df -h /
           sudo env "PATH=$PATH" "HOME=$HOME" \
             python3 builder/build_iso.py \
               --version "$DISTRO_VERSION" \

@@ -169,7 +169,9 @@ PACMAN_CONF = """#
 [options]
 HoldPkg     = pacman glibc
 Architecture = x86_64
-CheckSpace
+# No CheckSpace: in a chroot on CI runners the root mount point cannot be
+# resolved from the bind-mounted /proc, producing spurious
+# "not enough free disk space" aborts.
 SigLevel    = Required DatabaseOptional
 LocalFileSigLevel = Optional
 
