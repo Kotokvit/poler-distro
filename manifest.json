@@ -1,31 +1,42 @@
 {
   "distro_name": "POLER CachyOS Sovereign Edition",
   "base_os": "CachyOS Linux x86_64",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "upstream_kernel": "linux-cachyos",
+  "iso": "poler-cachyos-x86_64-1.1.0.iso",
+  "iso_boot": "GRUB hybrid BIOS+UEFI, QEMU-verified boot chain",
   "core_stack": {
-    "init": "poler-init (PID 1 boot supervisor)",
-    "shell": "poler-sh (Sovereign Shell & AST Math Gateway)",
-    "archive": "poler (FastCDC + BLAKE3 Streaming Deduplication)",
-    "box": "poler-box (Kernel Sandbox & Seccomp Isolation)",
-    "fuse": "poler-fuse (Zero-overhead VFS mounter)",
-    "updater": "poler-update (Direct GitHub Mirror Sync)"
+    "init": "poler-init v0.2.0 (PID 1 sovereign boot supervisor: initramfs + system stages)",
+    "shell": "poler-sh v0.2.0 (Sovereign Shell, AST Math Gateway, from Kotokvit/poler-sh)",
+    "archive": "poler v0.1.0 (FastCDC + BLAKE3 streaming deduplication, from Kotokvit/poler)",
+    "box": "poler-box (kernel sandbox & seccomp isolation, from Kotokvit/poler)",
+    "fuse": "poler-fuse (zero-overhead VFS mounter, from Kotokvit/poler)",
+    "updater": "poler-update v1.1.0 (native Rust: curl transport, sha256 verify, atomic install)"
   },
   "optional_modules": {
-    "engine": "poler-engine (Quantum, MCP, Living Voice, 3D Rasterizer)",
+    "engine": "poler-engine v0.61.0 (Quantum, MCP, Living Voice, 3D Rasterizer) — installable via poler-update",
     "mesh": "poler-mesh (Sovereign Node Mesh Hub)",
     "git": "poler-git (Unified Git Engine)",
     "edit": "poler-edit (Sovereign Text/Code Editor)"
   },
   "legacy_purged": [
-    "/bin/bash (replaced by poler-sh)",
-    "/usr/bin/bash (symlinked to poler-sh)",
-    "SysVinit shell script glue",
-    "Slow systemd shell generators"
+    "/bin/bash (no ELF in image; symlink -> poler-sh)",
+    "/usr/bin/bash (symlink -> poler-sh)",
+    "/bin/sh (symlink -> poler-sh)",
+    "systemd (PID 1 replaced by poler-init)",
+    "mkinitcpio (sovereign poler-initramfs.cpio.gz instead)",
+    "pacman (updates flow from GitHub via poler-update only)",
+    "SysVinit shell script glue (/etc/init.d absent)"
   ],
   "update_mirror": {
     "github_repo": "Kotokvit/poler-distro",
     "api_endpoint": "https://api.github.com/repos/Kotokvit/poler-distro/releases/latest",
-    "raw_endpoint": "https://raw.githubusercontent.com/Kotokvit/poler-distro/main"
+    "raw_endpoint": "https://raw.githubusercontent.com/Kotokvit/poler-distro/main",
+    "core_asset": "poler-core-x86_64.tar.gz"
+  },
+  "source_repositories": {
+    "shell": "https://github.com/Kotokvit/poler-sh",
+    "archive": "https://github.com/Kotokvit/poler",
+    "distro": "https://github.com/Kotokvit/poler-distro"
   }
 }

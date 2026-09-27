@@ -1,0 +1,19 @@
+[package]
+name = "poler-update"
+version = "1.1.0"
+edition = "2021"
+description = "POLER Sovereign Updater — synchronizes the system directly with the GitHub mirror Kotokvit/poler-distro. No bash, no legacy package manager: curl transport, sha256 verification, atomic install."
+license = "MIT"
+
+[[bin]]
+name = "poler-update"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

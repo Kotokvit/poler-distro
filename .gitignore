@@ -1,0 +1,7 @@
+out/
+binaries/
+sovereign/*/target/
+work/
+*.iso
+*.cpio.gz
+__pycache__/
