@@ -187,9 +187,11 @@ fn kernel_version() -> String {
 // ------------------------- kernel module loading ----------------------------
 
 /// Static priority list of modules required to reach the boot medium.
+/// Names are REAL module names (as in modules.dep, dashes normalized to
+/// underscores). "isofs" is the module behind the iso9660 filesystem alias.
 const BOOT_MODULES: &[&str] = &[
-    // SCSI core + CD-ROM + ISO9660 (optical boot, incl. QEMU IDE cdrom)
-    "scsi_mod", "cdrom", "sr_mod", "iso9660",
+    // SCSI core + CD-ROM + ISO9660/UDF (optical boot, incl. QEMU IDE cdrom)
+    "scsi_mod", "cdrom", "sr_mod", "isofs", "udf",
     // SATA/ATA (QEMU -cdrom default IDE: ata_piix + deps)
     "ata_piix", "ata_generic", "libata", "ahci", "sd_mod",
     // USB mass storage chain
@@ -200,6 +202,18 @@ const BOOT_MODULES: &[&str] = &[
     // Live root
     "squashfs", "loop",
 ];
+
+/// userspace aliases -> real module names (modprobe-style resolution).
+const MODULE_ALIASES: &[(&str, &str)] = &[("iso9660", "isofs")];
+
+fn resolve_alias(name: &str) -> &str {
+    for (alias, real) in MODULE_ALIASES {
+        if *alias == name {
+            return real;
+        }
+    }
+    name
+}
 
 struct ModulesDep {
     // basename (no .ko, no path) -> (relative path from module dir, deps)
@@ -234,24 +248,36 @@ fn parse_modules_dep(kver: &str) -> ModulesDep {
 }
 
 fn module_basename(rel: &str) -> String {
-    rel.rsplit('/')
-        .next()
-        .unwrap_or(rel)
-        .trim_end_matches(".ko")
-        .trim_end_matches(".ko.zst")
-        .trim_end_matches(".ko.xz")
-        .to_string()
+    // modprobe normalization: file names may use dashes or underscores
+    // interchangeably; underscores are the canonical module-name form.
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    let stem = base
+        .strip_suffix(".ko.zst")
+        .or_else(|| base.strip_suffix(".ko.xz"))
+        .or_else(|| base.strip_suffix(".ko"))
+        .unwrap_or(base);
+    stem.replace('-', "_")
 }
 
 fn load_boot_modules(kver: &str, debug: bool) {
     let dep = parse_modules_dep(kver);
     let base = format!("/usr/lib/modules/{}", kver);
     let mut loaded: Vec<String> = Vec::new();
+    let mut missing: Vec<&str> = Vec::new();
 
     for want in BOOT_MODULES {
-        load_module_tree(want, &dep, &base, &mut loaded, debug, 0);
+        let real = resolve_alias(want);
+        let before = loaded.len();
+        load_module_tree(real, &dep, &base, &mut loaded, debug, 0);
+        if loaded.len() == before && !dep.entries.iter().any(|(n, _, _)| n == real) {
+            missing.push(want);
+        }
     }
     log(format!("{} kernel modules loaded", loaded.len()).as_str());
+    if !missing.is_empty() {
+        // Not fatal: some of these may be built into the kernel (=y).
+        log(format!("not in modules.dep (built-in or absent): {:?}", missing).as_str());
+    }
 }
 
 fn load_module_tree(want: &str, dep: &ModulesDep, base: &str, loaded: &mut Vec<String>, debug: bool, depth: usize) {
@@ -332,13 +358,14 @@ fn insmod_compressed(path: &str) -> bool {
     decompressed_insmod(path)
 }
 
-/// Fallback: decompress via zstd/xz binaries present in the initramfs, then
-/// init_module from the decompressed buffer.
+/// Fallback: decompress via zstd/xz binaries present in the initramfs
+/// (absolute paths — PID 1 has no meaningful PATH), then init_module from
+/// the decompressed buffer.
 fn decompressed_insmod(path: &str) -> bool {
     let out = if path.ends_with(".zst") {
-        Command::new("zstd").arg("-d").arg("-c").arg(path).output()
+        Command::new("/usr/bin/zstd").arg("-d").arg("-c").arg(path).output()
     } else if path.ends_with(".xz") {
-        Command::new("xz").arg("-d").arg("-c").arg(path).output()
+        Command::new("/usr/bin/xz").arg("-d").arg("-c").arg(path).output()
     } else {
         return false;
     };
@@ -379,15 +406,15 @@ fn find_boot_medium(cmdline: &str, debug: bool) -> Option<PathBuf> {
     // Scan block devices for up to ~15 seconds (USB enumeration can be slow).
     for attempt in 0..30 {
         let devices = list_block_devices();
+        if attempt == 0 {
+            log(format!("scanning {} block device node(s) for POLER boot medium...", devices.len()).as_str());
+        }
         if !devices.is_empty() {
             for dev in devices {
                 if let Some(d) = try_mount_medium(&dev, debug) {
                     return Some(d);
                 }
             }
-        }
-        if attempt == 0 {
-            log("scanning block devices for POLER boot medium...");
         }
         thread::sleep(Duration::from_millis(500));
     }
@@ -530,7 +557,8 @@ fn mount_squashfs_loop(squashfs: &Path, target: &str) -> bool {
 
 fn delete_initramfs_files() {
     // Free ramfs memory the busybox switch_root way: wipe everything except
-    // the new root mount (already moved mounts are gone from this namespace).
+    // the new root mount. Mountpoints (e.g. a failed MS_MOVE) are skipped —
+    // deleting through them would destroy the moved filesystem's contents.
     let keep = ["mnt"];
     if let Ok(entries) = fs::read_dir("/") {
         for e in entries.flatten() {
@@ -544,11 +572,25 @@ fn delete_initramfs_files() {
                 Err(_) => continue,
             };
             if meta.is_dir() && !meta.file_type().is_symlink() {
-                let _ = fs::remove_dir_all(&path);
+                if !is_mountpoint(&path) {
+                    let _ = fs::remove_dir_all(&path);
+                }
             } else {
                 let _ = fs::remove_file(&path);
             }
         }
+    }
+}
+
+fn is_mountpoint(path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let parent = match Path::new(path).parent() {
+        Some(p) => p.to_string_lossy().to_string(),
+        None => return true,
+    };
+    match (fs::metadata(&path), fs::metadata(&parent)) {
+        (Ok(a), Ok(b)) => a.dev() != b.dev(),
+        _ => true, // be conservative when in doubt
     }
 }
 
@@ -730,6 +772,8 @@ fn emergency_shell(reason: &str) -> ! {
         if code == EXIT_POWEROFF {
             do_poweroff();
         }
+        // no shell available (or it exited) — avoid a log flood
+        thread::sleep(Duration::from_millis(700));
     }
 }
 

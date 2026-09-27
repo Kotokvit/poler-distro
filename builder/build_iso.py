@@ -80,8 +80,10 @@ POLER_BINARIES = {
 OPTIONAL_BINARIES = {"poler-box", "poler-fuse"}
 
 # Kernel modules the initramfs must carry to reach the boot medium.
+# NOTE: real module names as found in modules.dep ("isofs" is the module
+# behind the iso9660 alias; dashes are normalized to underscores).
 INITRAMFS_MODULES = [
-    "scsi_mod", "cdrom", "sr_mod", "iso9660",
+    "scsi_mod", "cdrom", "sr_mod", "isofs", "udf",
     "ata_piix", "ata_generic", "libata", "ahci", "sd_mod",
     "usb_common", "usbcore", "xhci_pci", "ehci_pci", "uhci_hcd",
     "usb_storage", "uas",
@@ -483,15 +485,19 @@ def stage_initramfs(rootfs, bins_dir, iso_tree, kver):
         copy_tool_with_libs(rootfs, tool, initrd_dir)
 
     # kernel modules closure (deps from modules.dep)
+    # NOTE: module files are .ko.zst (Arch packaging). They are DECOMPRESSED
+    # at build time so poler-init can insmod raw ELF via finit_module(0) on
+    # any kernel — no runtime decompression dependency at all.
     modsrc = os.path.join(rootfs, "usr/lib/modules", kver)
     moddst = os.path.join(initrd_dir, "usr/lib/modules", kver)
     dep_lines = open(os.path.join(modsrc, "modules.dep")).read().splitlines()
 
     def clean(name):
+        # modprobe-style normalization: dashes and underscores are equivalent
         return (name.replace(".ko.zst", "").replace(".ko.xz", "")
-                    .replace(".ko", ""))
+                    .replace(".ko", "").replace("-", "_"))
 
-    dep_map = {}      # module name -> (rel path, [dep names])
+    dep_map = {}      # normalized module name -> (rel path, [dep names])
     for line in dep_lines:
         left, _, right = line.partition(":")
         rel = left.strip()
@@ -511,16 +517,33 @@ def stage_initramfs(rootfs, bins_dir, iso_tree, kver):
     for want in INITRAMFS_MODULES:
         add(want)
 
+    resolved = {n: dep_map[n] for n in keep}
+
     for name in sorted(keep):
-        rel = dep_map[name][0]
+        rel = resolved[name][0]
         src = os.path.join(modsrc, rel)
         dst = os.path.join(moddst, rel)
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy2(src, dst)
+        if rel.endswith(".ko.zst") or rel.endswith(".ko.xz"):
+            dst = dst[: -len(".zst")] if rel.endswith(".ko.zst") else dst[: -len(".xz")]
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            tool = "zstd" if rel.endswith(".zst") else "xz"
+            r = subprocess.run([tool, "-d", "-c", src], capture_output=True)
+            if r.returncode != 0:
+                die(f"cannot decompress module {rel}")
+            open(dst, "wb").write(r.stdout)
+        else:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
 
+    # filtered modules.dep with decompressed paths
     with open(os.path.join(moddst, "modules.dep"), "w") as out:
         for line in dep_lines:
-            if line.split(":")[0].strip() and clean(os.path.basename(line.split(":")[0])) in keep:
+            rel = line.split(":")[0].strip()
+            if rel and clean(os.path.basename(rel)) in keep:
+                if rel.endswith(".ko.zst"):
+                    line = line.replace(rel, rel[: -len(".zst")])
+                elif rel.endswith(".ko.xz"):
+                    line = line.replace(rel, rel[: -len(".xz")])
                 out.write(line + "\n")
     for aux in ["modules.alias", "modules.symbols", "modules.builtin",
                 "modules.builtin.modinfo", "modules.order"]:
@@ -528,7 +551,10 @@ def stage_initramfs(rootfs, bins_dir, iso_tree, kver):
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(moddst, aux))
 
-    log(f"initramfs modules: {len(keep)}")
+    unresolved = [m for m in INITRAMFS_MODULES if m not in dep_map]
+    if unresolved:
+        print(f"{YELLOW}[note]{RESET} built-in or absent modules (skipped): {', '.join(unresolved)}")
+    log(f"initramfs modules: {len(keep)} (decompressed to raw ELF)")
 
     img = os.path.join(iso_tree, "boot/poler-initramfs.cpio.gz")
     os.makedirs(os.path.dirname(img), exist_ok=True)
