@@ -181,11 +181,8 @@ Server = {arch_mirror}/$repo/os/$arch
 [extra]
 Server = {arch_mirror}/$repo/os/$arch
 
-[cachyos-core]
-Server = {cachyos_mirror}/$arch/cachyos-core
-
-[cachyos-extra]
-Server = {cachyos_mirror}/$arch/cachyos-extra
+[cachyos]
+Server = {cachyos_mirror}/$arch/cachyos
 """
 
 
