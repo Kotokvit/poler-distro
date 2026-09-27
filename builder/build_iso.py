@@ -419,7 +419,19 @@ def stage_squashfs(rootfs, iso_tree):
     sh(f"mksquashfs '{rootfs}' '{sq}' -noappend -comp zstd -Xcompression-level 19 "
        f"-no-exports -wildcards "
        f"-e 'var/cache/pacman/pkg' 'boot/vmlinuz*'")
-    ok(f"live.squashfs: {os.path.getsize(sq) / 1e6:.1f} MB")
+
+    # HARD PROOF: the sovereign stack must be inside the squashfs.
+    missing = [n for n in POLER_BINARIES
+               if n not in OPTIONAL_BINARIES
+               and not os.path.exists(os.path.join(rootfs, f"usr/bin/{n}"))]
+    if missing:
+        die(f"rootfs lost POLER binaries before squashfs: {missing}")
+    r = subprocess.run(["unsquashfs", "-ll", sq], capture_output=True, text=True)
+    listing = r.stdout or ""
+    for name in ["poler-init", "poler-sh", "poler-update"]:
+        if name not in listing:
+            die(f"squashfs does not contain {name} — build is broken")
+    ok(f"live.squashfs: {os.path.getsize(sq) / 1e6:.1f} MB (sovereign stack verified inside)")
     return sq
 
 

@@ -99,26 +99,40 @@ fn initramfs_stage() -> ! {
         emergency_shell("squashfs mount failed");
     }
 
-    // Move pseudo-filesystems into the new root.
+    // PROOF the live image carries the sovereign stack before we switch.
+    match fs::read_dir("/mnt/usr/bin") {
+        Ok(entries) => {
+            let names: Vec<String> = entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            let poler_count = names.iter().filter(|n| n.starts_with("poler")).count();
+            log(format!("live image /usr/bin: {} entries, {} poler-*", names.len(), poler_count).as_str());
+            if poler_count == 0 {
+                log("\x1b[1;31mFATAL: squashfs has no POLER binaries — image is broken\x1b[0m");
+                emergency_shell("sovereign stack missing in live image");
+            }
+        }
+        Err(e) => log(format!("warning: cannot list /mnt/usr/bin: {}", e).as_str()),
+    }
+
+    // Move pseudo-filesystems into the new root (best effort).
     for (src, dst) in [("/dev", "/mnt/dev"), ("/proc", "/mnt/proc"), ("/sys", "/mnt/sys"), ("/run", "/mnt/run")] {
         ensure_dir(dst);
-        // /run may be a fresh tmpfs in initramfs; move only what exists mounted.
         if Path::new(src).exists() {
-            let _ = unsafe { mount_move(src, dst) };
+            let rc = unsafe { mount_move(src, dst) };
+            if rc.is_err() {
+                log(format!("warning: could not move {} into the live root", src).as_str());
+            }
         }
     }
 
-    // Free initramfs memory: delete everything except the mount target tree.
-    delete_initramfs_files();
-
-    // switch_root
+    // switch_root — SIMPLE & BULLETPROOF: chroot into the live root and stay
+    // there. The initramfs remains mounted (a few MB of RAM) in exchange for
+    // eliminating the fragile MS_MOVE(".", "/") + ramfs-wipe dance.
     unsafe {
         if chdir_c("/mnt").is_err() {
             log("chdir /mnt failed");
-            emergency_shell("switch_root failed");
-        }
-        if mount_move(".", "/").is_err() {
-            log("MS_MOVE . -> / failed");
             emergency_shell("switch_root failed");
         }
         if chroot_c(".").is_err() {
@@ -590,45 +604,8 @@ fn mount_squashfs_loop(squashfs: &Path, target: &str) -> bool {
 }
 
 // ------------------------------ switch_root ---------------------------------
-
-fn delete_initramfs_files() {
-    // Free ramfs memory the busybox switch_root way: wipe everything except
-    // the new root mount. Mountpoints (e.g. a failed MS_MOVE) are skipped —
-    // deleting through them would destroy the moved filesystem's contents.
-    let keep = ["mnt"];
-    if let Ok(entries) = fs::read_dir("/") {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if keep.contains(&name.as_str()) {
-                continue;
-            }
-            let path = format!("/{}", name);
-            let meta = match fs::symlink_metadata(&path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if meta.is_dir() && !meta.file_type().is_symlink() {
-                if !is_mountpoint(&path) {
-                    let _ = fs::remove_dir_all(&path);
-                }
-            } else {
-                let _ = fs::remove_file(&path);
-            }
-        }
-    }
-}
-
-fn is_mountpoint(path: &str) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let parent = match Path::new(path).parent() {
-        Some(p) => p.to_string_lossy().to_string(),
-        None => return true,
-    };
-    match (fs::metadata(&path), fs::metadata(&parent)) {
-        (Ok(a), Ok(b)) => a.dev() != b.dev(),
-        _ => true, // be conservative when in doubt
-    }
-}
+// (chroot-based; see initramfs_stage — the initramfs stays mounted, the MS_MOVE
+// + ramfs-wipe busybox dance was removed for robustness)
 
 // ============================ Stage 2: live system ===========================
 
