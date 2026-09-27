@@ -29,8 +29,13 @@ const EXIT_POWEROFF: i32 = 43;
 const RB_AUTOBOOT: libc::c_int = 0x01234567;
 const RB_POWER_OFF: libc::c_int = 0x4321fedc;
 const SYS_FINIT_MODULE: libc::c_long = 313; // x86_64
-const LOOP_CTL_GET_FREE: libc::c_ulong = 0x4C82;
-const LOOP_SET_FD: libc::c_ulong = 0x4C00;
+// ioctl request type differs between libc targets (glibc: c_ulong, musl: c_int)
+#[cfg(target_env = "musl")]
+type IoctlReq = libc::c_int;
+#[cfg(not(target_env = "musl"))]
+type IoctlReq = libc::c_ulong;
+const LOOP_CTL_GET_FREE: IoctlReq = 0x4C82;
+const LOOP_SET_FD: IoctlReq = 0x4C00;
 const INITRAMFS_MARKER: &str = "/.poler-initramfs";
 
 static PENDING_ACTION: AtomicI32 = AtomicI32::new(0); // 0 none, 1 reboot, 2 poweroff
