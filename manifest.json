@@ -4,10 +4,17 @@
   "version": "1.0.0",
   "upstream_kernel": "linux-cachyos",
   "sovereign_stack": {
-    "init": "poler-init v0.1.0 (PID 1)",
-    "shell": "poler-sh v0.2.0 (AST Math, SIMD Search, Native Tools)",
-    "engine": "poler-engine v0.61.0",
-    "archive": "poler v0.1.0 (FastCDC + BLAKE3)"
+    "init": "poler-init v0.1.0 (PID 1 bootloader)",
+    "shell": "poler-sh v0.2.0 (Sovereign Terminal Gateway & AST Math)",
+    "engine": "poler-engine v0.61.0 (Quantum, MCP, Living Voice, Windowing)",
+    "exec": "poler-exec v1.0.0 (Sovereign Compute & Native Pipeline)",
+    "box": "poler-box v0.1.0 (Kernel Sandbox & Seccomp)",
+    "fuse": "poler-fuse v0.1.0 (Zero-overhead VFS mounter)",
+    "archive": "poler v0.1.0 (FastCDC + BLAKE3 Deduplication)",
+    "git": "poler-git v1.0.0 (Unified Git Engine)",
+    "mesh": "poler-mesh v1.0.0 (Sovereign Node Mesh)",
+    "edit": "poler-edit v1.0.0 (Sovereign Editor)",
+    "updater": "poler-update (Direct GitHub Mirror Sync)"
   },
   "legacy_purged": [
     "/bin/bash (replaced by poler-sh)",

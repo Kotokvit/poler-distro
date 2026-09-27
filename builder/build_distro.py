@@ -38,8 +38,15 @@ def build_distro():
     sovereign_bins = {
         "/home/vitalij/Стільниця/poler/target/release/poler-init": "bin/poler-init",
         "/home/vitalij/.local/bin/poler-sh": "bin/poler-sh",
-        "/home/vitalij/.local/bin/poler": "bin/poler",
+        "/home/vitalij/.local/bin/poler-exec": "bin/poler-exec",
         "/home/vitalij/.local/bin/poler-engine": "bin/poler-engine",
+        "/home/vitalij/.local/bin/poler-box": "bin/poler-box",
+        "/home/vitalij/.local/bin/poler-fuse": "bin/poler-fuse",
+        "/home/vitalij/.local/bin/poler": "bin/poler",
+        "/home/vitalij/.local/bin/poler-git": "bin/poler-git",
+        "/home/vitalij/.local/bin/poler-mesh": "bin/poler-mesh",
+        "/home/vitalij/.local/bin/poler-edit": "bin/poler-edit",
+        "/home/vitalij/.local/bin/poler-update": "bin/poler-update",
     }
 
     for src, dst in sovereign_bins.items():
