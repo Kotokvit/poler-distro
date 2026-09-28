@@ -1,15 +1,15 @@
 {
   "distro_name": "POLER CachyOS Sovereign Edition",
   "base_os": "CachyOS Linux x86_64",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "upstream_kernel": "linux-cachyos",
-  "iso": "poler-cachyos-x86_64-1.2.0.iso",
-  "iso_boot": "GRUB hybrid BIOS+UEFI (sovereign + rescue entries), QEMU-verified boot chain",
+  "iso": "poler-cachyos-x86_64-1.3.0.iso",
+  "iso_boot": "GRUB hybrid BIOS+UEFI (sovereign + rescue + ISO-file-scan entries), double QEMU-verified per build (classic AND Ventoy simulation)",
   "core_stack": {
-    "init": "poler-init v0.3.0 (PID 1 sovereign boot supervisor: initramfs + system stages, engine supervision, poler.rescue=1 rescue mode, marker-file power control)",
+    "init": "poler-init v0.4.0 (PID 1 sovereign boot supervisor: initramfs + system stages, engine supervision, poler.rescue=1 rescue mode, marker-file power control)",
     "shell": "poler-engine v0.61.0 Terminal Gateway (PRIMARY console shell: double execution contour, pipes, redirects, native retrieval — official release binary from poler-engine-org/poler-engine, sha256-pinned)",
-    "fallback_shell": "poler-sh v0.2.0 (rescue/compat shell from Kotokvit/poler-sh; /etc/passwd root shell; forced via poler.rescue=1)",
-    "power": "poler-powerctl v0.3.0 (sovereign reboot/poweroff/halt: marker IPC to PID 1 — works from inside the engine gateway)",
+    "fallback_shell": "poler-sh v0.2.0 (rescue/compat shell from Kotokvit/poler-sh; /etc/passwd root shell; forced via poler.rescue=1; ALSO shipped inside the initramfs as the interactive emergency console)",
+    "power": "poler-powerctl v0.4.0 (sovereign reboot/poweroff/halt: marker IPC to PID 1 — works from inside the engine gateway)",
     "archive": "poler v0.1.0 (FastCDC + BLAKE3 streaming deduplication, from Kotokvit/poler)",
     "box": "poler-box (kernel sandbox & seccomp isolation, from Kotokvit/poler)",
     "fuse": "poler-fuse (zero-overhead VFS mounter, from Kotokvit/poler)",
@@ -23,6 +23,13 @@
   "engine_channel": {
     "engine": "poler-engine v0.61.0 — installable on ANY system via: poler-update --install engine (official release binary, sha256-pinned)",
     "repository": "https://github.com/poler-engine-org/poler-engine"
+  },
+  "real_hardware_boot": {
+    "ventoy": "ISO-file scan: the distro .iso as a FILE on vfat/exFAT/NTFS/ext4 — poler-init loop-mounts the ISO itself (GRUB entry 'ISO-file scan'; poler.findiso=1)",
+    "direct": "dd / Rufus-DD / optical: partition or whole disk carrying /poler/live.squashfs",
+    "initramfs_modules": "NVMe, xHCI/EHCI/UHCI/OHCI USB, UAS, usbhid keyboards, vfat/exFAT/NTFS3/ext4, SD/mmc, virtio, SATA/AHCI, squashfs+loop",
+    "firmware": "linux-firmware for real hardware (WiFi/BT/NIC/audio); GPU blobs purged — no graphics stack in the image, kernel text console needs none",
+    "consoles": "/dev/tty1 (physical monitor + keyboard, PRIMARY), /dev/console (serial), tty2/tty3 (Alt+F2/F3); emergency poler-sh console inside the initramfs ('exit 44' rescan)"
   },
   "rescue": {
     "kernel_cmdline": "poler.rescue=1",

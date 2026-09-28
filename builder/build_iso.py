@@ -6,9 +6,12 @@ Pipeline (requires root; designed for GitHub Actions ubuntu-latest):
   1. Fetch the Arch Linux bootstrap rootfs (real, pacman-equipped base).
   2. Point pacman at the sovereign CachyOS mirrors (cachyos-core/extra),
      install cachyos-keyring + cachyos-mirrorlist, sync packages
-     (linux-cachyos kernel, core userland, curl for updates).
+     (linux-cachyos kernel, linux-firmware for real hardware, core userland,
+     curl for updates).
   3. PURGE legacy: bash, systemd, SysVinit glue, mkinitcpio, pacman itself —
-     the sovereign image carries zero legacy shell/PID-1 glue.
+     the sovereign image carries zero legacy shell/PID-1 glue. GPU firmware
+     blobs are purged too (no graphics stack = dead weight; text console
+     works on the VGA/EFI framebuffer without them).
   4. Fetch the official poler-engine release (sha256-pinned) — its Terminal
      Gateway is the PRIMARY interactive shell of the live system.
   5. Inject the POLER sovereign stack:
@@ -20,16 +23,21 @@ Pipeline (requires root; designed for GitHub Actions ubuntu-latest):
   6. Write /etc/os-release (POLER CachyOS Sovereign Edition) and
      /poler/VERIFICATION.txt with the full build proof.
   7. mksquashfs the rootfs -> /poler/live.squashfs.
-  8. Build poler-initramfs.cpio.gz: poler-init /init + kernel modules needed
-     to reach the medium (iso9660/sr_mod/ata_piix/ahci/usb/squashfs/loop)
-     + zstd/xz fallback decompressors with their shared libs.
-  9. grub-mkrescue -> hybrid BIOS+UEFI ISO (xorriso).
- 10. QEMU smoke boot (--qemu): boots the ISO, asserts the sovereign chain
-     (poler-init stage 1 -> stage 2 -> poler-engine Terminal Gateway) on the
-     serial console.
+  8. Build poler-initramfs.cpio.gz: poler-init /init + poler-sh emergency
+     shell + kernel modules for REAL hardware (NVMe, xHCI/UHCI/EHCI/OHCI
+     USB, usbhid keyboards, vfat/exFAT/NTFS3/ext4 for Ventoy sticks, SD/mmc,
+     virtio, SATA/AHCI, squashfs/loop) + zstd/xz fallback decompressors.
+  9. grub-mkrescue -> hybrid BIOS+UEFI ISO (xorriso) with a Ventoy/findiso
+     boot entry next to the default/rescue entries.
+ 10. QEMU boot proofs (--qemu):
+     Test 1 — classic boot: ISO as -cdrom (dd/Rufus path), assert the chain
+     poler-init stage 1 -> stage 2 -> poler-engine Terminal Gateway.
+     Test 2 — Ventoy simulation: the ISO as a plain FILE on a vfat disk,
+     booted with poler.findiso=1 (the real-PC failure mode: v1.2.0 could
+     not boot it; the ISO-file scan must prove itself here).
 
 Usage:
-  sudo python3 builder/build_iso.py [--version 1.2.0] [--qemu] [--keep-work]
+  sudo python3 builder/build_iso.py [--version 1.3.0] [--qemu] [--keep-work]
 """
 
 import argparse
@@ -53,12 +61,25 @@ ARCH_MIRROR = "https://geo.mirror.pkgbuild.com"
 KERNEL_PKG = "linux-cachyos"
 
 # Extra packages synced into the bootstrap base (curl = poler-update transport).
+# linux-firmware: real-hardware support (WiFi/BT/NIC/audio/input firmware).
+# GPU blobs are purged afterwards — see GPU_FIRMWARE_PURGE (no X/Wayland stack
+# in the image means GPU firmware is dead weight; text console works without).
 ROOT_PKGS = [
     KERNEL_PKG,
+    "linux-firmware",
     "curl", "ca-certificates", "ca-certificates-mozilla",
     "zstd", "xz", "tar", "gzip",
     "tzdata", "iana-etc", "less", "which",
     "iproute2", "iputils",
+]
+
+# GPU firmware directories removed from /usr/lib/firmware after the sync.
+# Rationale: the sovereign edition has NO graphics stack (no X, no Wayland,
+# no Mesa) — the kernel text console (VGA/EFI framebuffer) does not load
+# GPU firmware, so these ~1+ GB blobs are pure dead weight. Everything
+# needed for boot + networking + input on real PCs stays in the image.
+GPU_FIRMWARE_PURGE = [
+    "nvidia", "amdgpu", "radeon", "i915", "xe", "amd",
 ]
 
 # Legacy packages purged from the final image (force, deps ignored — the
@@ -101,12 +122,19 @@ ENGINE_SHA256 = "abd6e98b47b6282e929a6ddd6e7172c76c88e10ec5d45dce0d88a0388117b54
 # Kernel modules the initramfs must carry to reach the boot medium.
 # NOTE: real module names as found in modules.dep ("isofs" is the module
 # behind the iso9660 alias; dashes are normalized to underscores).
+# KEEP IN SYNC with BOOT_MODULES in sovereign/poler-init/src/main.rs.
+# Coverage: optical/IDE (QEMU), SATA/AHCI, NVMe, USB1.1/2/3.x hosts,
+# USB keyboards, FAT/exFAT/NTFS/ext4 flash filesystems (incl. Ventoy
+# sticks), SD/mmc readers, virtio (KVM), squashfs + loop for the live root.
 INITRAMFS_MODULES = [
     "scsi_mod", "cdrom", "sr_mod", "isofs", "udf",
     "ata_piix", "ata_generic", "libata", "ahci", "sd_mod",
-    "usb_common", "usbcore", "xhci_pci", "ehci_pci", "uhci_hcd",
-    "usb_storage", "uas",
-    "nls_cp437", "nls_iso8859_1", "vfat", "fat",
+    "nvme", "nvme_core",
+    "usb_common", "usbcore", "xhci_pci", "ehci_pci", "uhci_hcd", "ohci_pci",
+    "usb_storage", "uas", "usbhid", "hid_generic",
+    "nls_cp437", "nls_iso8859_1", "nls_utf8", "vfat", "fat", "exfat", "ntfs3",
+    "mmc_block", "sdhci", "sdhci_pci",
+    "virtio_pci", "virtio_blk", "virtio_scsi",
     "squashfs", "loop",
 ]
 
@@ -258,6 +286,20 @@ def stage_purge_legacy(rootfs):
     for pkg in PURGE_PKGS:
         sh(f"chroot '{rootfs}' /usr/bin/pacman -Rdd --noconfirm {pkg} 2>/dev/null",
            check=False, quiet=True)
+
+    # GPU firmware blobs: dead weight in a text-console distro (see
+    # GPU_FIRMWARE_PURGE rationale above). Logged in MB so the size math
+    # of the final ISO stays explainable.
+    fw_dir = os.path.join(rootfs, "usr/lib/firmware")
+    if os.path.isdir(fw_dir):
+        before = du_gb(fw_dir)
+        for sub in GPU_FIRMWARE_PURGE:
+            p = os.path.join(fw_dir, sub)
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+        after = du_gb(fw_dir)
+        ok(f"firmware kept for real hardware: {after:.2f} GB "
+           f"(GPU blobs purged: {before - after:.2f} GB — no graphics stack in the image)")
 
     # Hard evidence: no bash ELF may survive anywhere.
     for victim in ["usr/bin/bash", "usr/bin/sh", "bin/bash", "bin/sh", "usr/bin/systemd"]:
@@ -463,6 +505,8 @@ source              : https://github.com/poler-engine-org/poler-engine
 sha256 (pinned)     : {ENGINE_SHA256}
 rescue shell        : poler-sh v0.2.0 (https://github.com/Kotokvit/poler-sh)
                        — fallback console shell + #!/bin/sh compat layer
+                       — ALSO INSIDE the initramfs (emergency console with
+                       'exit 44' rescan — no more dark crash loops)
 power control       : poler-powerctl (/usr/bin/reboot, /usr/bin/poweroff,
                        /usr/bin/halt) — marker IPC to poler-init PID 1
 
@@ -481,14 +525,33 @@ BOOT CHAIN
 ----------
 GRUB (BIOS+UEFI) -> vmlinuz-cachyos + poler-initramfs.cpio.gz
   -> poler-init stage 1 (modules, medium scan, squashfs loop, switch_root)
+     boot medium discovery — TWO paths:
+       a) DIRECT: partition/disk carrying /poler/live.squashfs
+          (dd / Rufus-DD / optical / OptiDrive)
+       b) ISO-FILE (Ventoy): the distro .iso as a FILE on vfat/exFAT/
+          ntfs/ext4 — poler-init loop-mounts the ISO itself
+          (poler.findiso=1 forces this path; GRUB ships an entry)
   -> poler-init stage 2 (tmpfs /run,/tmp,/root; console supervision; markers)
-  -> poler-engine --gateway sessions on /dev/console, tty2..tty4
+  -> poler-engine --gateway sessions: /dev/tty1 (physical monitor, PRIMARY)
+     + /dev/console (serial) + tty2/tty3 (Alt+F2/F3)
      (poler.rescue=1 on the kernel cmdline bypasses the engine -> poler-sh)
+
+REAL-HARDWARE SUPPORT
+---------------------
+initramfs modules  : NVMe, USB1.1/2/3.x (xHCI/EHCI/UHCI/OHCI), UAS, USB
+                     keyboards (usbhid/hid_generic), vfat/exFAT/NTFS3/ext4,
+                     SD/mmc readers, virtio, SATA/AHCI, squashfs+loop
+firmware           : linux-firmware for real hardware (WiFi/BT/NIC/audio);
+                     GPU blobs PURGED — no graphics stack in the image, the
+                     kernel text console needs no GPU firmware
+emergency console  : poler-sh inside the initramfs — on /dev/tty1 (monitor)
+                     with 'exit 44' rescan; never a dark loop again
 
 UPDATE PATH
 -----------
 poler-update -> https://github.com/Kotokvit/poler-distro/releases/latest
 (sha256-verified, atomic, no legacy package manager involved)
+poler-update --install engine -> official poler-engine release channel
 """
     open(vfile, "w").write(content)
     ok("VERIFICATION.txt written into the image")
@@ -584,6 +647,28 @@ def stage_initramfs(rootfs, bins_dir, iso_tree, kver):
     # inside the initramfs, otherwise the kernel panics with
     # "Failed to execute /init (error -2)" (ENOENT on ld-linux).
     copy_elf_libs(os.path.join(bins_dir, "poler-init"), initrd_dir)
+
+    # EMERGENCY SHELL INSIDE THE INITRAMFS. v1.2.0 shipped no shell binary
+    # here at all: when the boot medium was not found on a real PC, poler-init
+    # fell into an INVISIBLE crash loop ("boot medium not found" went to a
+    # serial port nobody had, and the emergency shell did not exist). The
+    # emergency poler-sh gives the user an interactive console with 'exit 44'
+    # rescan — in the image, not in a dream.
+    static_sh = os.path.join(bins_dir, "poler-sh-static")
+    glibc_sh = os.path.join(bins_dir, "poler-sh")
+    em = os.path.join(initrd_dir, "usr/bin/poler-sh")
+    if os.path.exists(static_sh):
+        shutil.copy2(static_sh, em)
+        os.chmod(em, 0o755)
+        ok("initramfs emergency shell: poler-sh (static musl — zero deps)")
+    elif os.path.exists(glibc_sh):
+        shutil.copy2(glibc_sh, em)
+        os.chmod(em, 0o755)
+        copy_elf_libs(glibc_sh, initrd_dir)
+        ok("initramfs emergency shell: poler-sh (glibc + interpreter/libs)")
+    else:
+        die("no poler-sh available for the initramfs emergency shell — "
+            "the real-hardware boot story requires it")
 
     # fallback module decompressors (+ shared libs)
     for tool in ["zstd", "xz"]:
@@ -689,6 +774,12 @@ menuentry 'POLER emergency shell' {
     linux /boot/vmlinuz-cachyos poler.live=1 poler.rescue=1 console=tty0 console=ttyS0,115200n8
     initrd /boot/poler-initramfs.cpio.gz
 }
+
+menuentry 'POLER (ISO-file scan — Ventoy sticks)' {
+    search --no-floppy --set=root --file /{marker}
+    linux /boot/vmlinuz-cachyos poler.live=1 poler.findiso=1 console=tty0 console=ttyS0,115200n8
+    initrd /boot/poler-initramfs.cpio.gz
+}
 """
 
 
@@ -748,6 +839,54 @@ def stage_qemu(iso_path, timeout_s=240):
     ok("QEMU boot verification PASSED — sovereign chain reaches the poler-engine Terminal Gateway")
 
 
+def stage_qemu_findiso(iso_path, kernel_img, initrd_img, timeout_s=300):
+    """Ventoy simulation: boot with the distro ISO as a FILE on a second
+    (vfat) disk, bypassing direct media via poler.findiso=1.
+
+    This reproduces exactly what failed on the user's real PC: Ventoy keeps
+    the ISO as a plain file on an exFAT stick — the v1.2.0 scanner only
+    mounted block devices looking for /poler/live.squashfs at the mount
+    root and never found it. The ISO-file scan (mount fs -> find *.iso ->
+    loop-mount the ISO -> read live.squashfs out of it) must prove itself
+    here before any release ships.
+    """
+    log("QEMU Ventoy simulation (ISO as a FILE on a vfat disk, poler.findiso=1)...")
+    usb_img = "/tmp/poler_ventoy_test.img"
+    iso_mb = int(os.path.getsize(iso_path) / (1024 * 1024)) + 64
+    sh(f"rm -f '{usb_img}' && truncate -s {iso_mb}M '{usb_img}'")
+    sh(f"mkfs.vfat -n POLERTEST '{usb_img}'")
+    sh(f"mcopy -i '{usb_img}' '{iso_path}' ::/")
+    log_file = "/tmp/poler_qemu_findiso.log"
+    sh(f"timeout {timeout_s} qemu-system-x86_64 -m 2048 "
+       f"-kernel '{kernel_img}' -initrd '{initrd_img}' "
+       f"-append 'poler.live=1 poler.findiso=1 console=tty0 console=ttyS0,115200n8' "
+       f"-drive file='{usb_img}',format=raw -machine pc -cpu max "
+       f"-nographic -serial mon:stdio -display none -no-reboot "
+       f"2>&1 | tee {log_file}", check=False)
+
+    text = open(log_file, errors="ignore").read() if os.path.exists(log_file) else ""
+    checks = [
+        ("poler-init stage 1 (initramfs)", "sovereign boot stage 1" in text),
+        ("kernel modules loaded", "kernel modules loaded" in text),
+        ("findiso mode active", "poler.findiso=1" in text),
+        ("ISO file candidate found on disk", "iso-scan:" in text and "candidate" in text),
+        ("ISO loop-mounted (Ventoy path)", "iso-scan: loop-mounted" in text),
+        ("boot medium resolved", "boot medium:" in text),
+        ("poler-init stage 2 (system)", "sovereign boot stage 2" in text),
+        ("poler-engine Terminal Gateway live on console",
+         "POLER Engine" in text and "Terminal Gateway" in text),
+    ]
+    failed = [name for name, passed in checks if not passed]
+    for name, passed in checks:
+        mark = f"{GREEN}PASS{RESET}" if passed else f"{RED}FAIL{RESET}"
+        print(f"  [{mark}] {name}", flush=True)
+    os.remove(usb_img)
+    if failed:
+        die(f"QEMU Ventoy-simulation verification failed: {failed}")
+    ok("QEMU Ventoy simulation PASSED — the ISO boots as a plain FILE from a "
+       "vfat/exFAT-style disk (the real-PC failure mode is fixed)")
+
+
 # ---------------------------------------------------------------------- main --
 
 def detect_kver(rootfs):
@@ -776,7 +915,7 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--bins", default=None)
     ap.add_argument("--kernel", default=KERNEL_PKG)
-    ap.add_argument("--version", default="1.2.0")
+    ap.add_argument("--version", default="1.3.0")
     ap.add_argument("--qemu", action="store_true")
     args = ap.parse_args()
 
@@ -827,7 +966,7 @@ def main():
     # 8. ISO
     iso_path = stage_iso(work, iso_tree, args.version, kernel_img)
 
-    # 9. integrity + optional QEMU boot proof
+    # 9. integrity + optional QEMU boot proofs
     sums = os.path.join(out, "SHA256SUMS")
     with open(sums, "w") as f:
         f.write(f"{sha256_file(iso_path)}  {os.path.basename(iso_path)}\n")
@@ -835,7 +974,14 @@ def main():
     ok(f"sha256: {sha256_file(iso_path)}")
 
     if args.qemu:
+        # Test 1: classic boot (dd/Rufus/OptiDrive — direct medium).
         stage_qemu(os.path.join(out, os.path.basename(iso_path)))
+        # Test 2: Ventoy simulation — the ISO as a plain FILE on a vfat disk
+        # (the exact real-PC failure mode reported by the user).
+        stage_qemu_findiso(
+            os.path.join(out, os.path.basename(iso_path)),
+            os.path.join(iso_tree, "boot/vmlinuz-cachyos"),
+            os.path.join(iso_tree, "boot/poler-initramfs.cpio.gz"))
 
     log(f"DONE -> {out}")
     print(f"\n{GREEN}ISO artifact:{RESET} {os.path.join(out, os.path.basename(iso_path))}")

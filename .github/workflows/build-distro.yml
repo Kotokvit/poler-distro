@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 env:
-  DISTRO_VERSION: "1.2.0"
+  DISTRO_VERSION: "1.3.0"
   # The sovereign engine is fetched as the OFFICIAL release binary (never
   # rebuilt from 389 MB of sources in CI) — build_iso.py pins its sha256:
   #   v0.61.0 / abd6e98b47b6282e929a6ddd6e7172c76c88e10ec5d45dce0d88a0388117b547
@@ -19,7 +19,7 @@ env:
 jobs:
   build-iso:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: Checkout distro repository
         uses: actions/checkout@v4
@@ -36,12 +36,13 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 xorriso grub-pc-bin grub-efi-amd64-bin mtools \
-            squashfs-tools cpio zstd xz-utils curl ca-certificates \
+            dosfstools squashfs-tools cpio zstd xz-utils curl ca-certificates \
             pkg-config libfuse-dev libfuse3-dev musl-tools
           echo "--- toolchain check ---"
           qemu-system-x86_64 --version | head -1
           mksquashfs -version 2>&1 | head -1
           xorriso --version 2>&1 | head -1 || true
+          mkfs.vfat --help 2>&1 | head -1 || true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -71,6 +72,17 @@ jobs:
           echo "--- sovereign shell sanity ---"
           binaries/poler-sh -c "calc 2^10 + sqrt(144)*2"
           binaries/poler-sh -c "= 100 km/h to m/s"
+          # Static musl build for the INITRAMFS emergency shell: a failed
+          # medium scan on real hardware must land the user in an interactive
+          # poler-sh console, not a dark crash loop. Best-effort (the glibc
+          # build + copy_elf_libs is the builder's fallback).
+          if (cd /tmp/poler-sh && cargo build --release --target x86_64-unknown-linux-musl); then
+            cp /tmp/poler-sh/target/x86_64-unknown-linux-musl/release/poler-sh binaries/poler-sh-static
+            file binaries/poler-sh-static | grep -q statically \
+              || echo "WARN: poler-sh-static is not static — builder will use the glibc fallback"
+          else
+            echo "WARN: musl poler-sh build unavailable — initramfs will carry the glibc build + libs"
+          fi
 
       - name: Build poler archive suite from Kotokvit/poler
         run: |
@@ -96,7 +108,8 @@ jobs:
       - name: Build the POLER CachyOS x86_64 ISO (engine = primary console shell)
         run: |
           set -e
-          # reclaim disk occupied by intermediate cargo builds
+          # reclaim disk occupied by intermediate cargo builds — the firmware
+          # -equipped image needs the room
           sudo rm -rf /tmp/poler-sh /tmp/poler sovereign/poler-init/target \
             sovereign/poler-update/target ~/.cargo/registry/cache || true
           df -h /
@@ -148,15 +161,20 @@ jobs:
             out/manifest.json
             out/SHA256SUMS
           body: |
-            POLER CachyOS Sovereign Edition ${{ env.DISTRO_VERSION }} — engine as the console
+            POLER CachyOS Sovereign Edition ${{ env.DISTRO_VERSION }} — real-hardware support
 
             * Base: CachyOS x86_64 (linux-cachyos kernel, sovereign mirrors)
-            * PID 1: poler-init v0.3.0 (no systemd) — engine supervision + rescue
+            * PID 1: poler-init v0.4.0 (no systemd) — engine supervision + rescue
             * Primary console shell: poler-engine v0.61.0 Terminal Gateway
               (official release binary, sha256-pinned; pipes, redirects, native retrieval)
-            * Fallback/rescue shell: poler-sh 0.2.0 (`poler.rescue=1` GRUB entry)
+            * Fallback/rescue shell: poler-sh 0.2.0 (`poler.rescue=1` GRUB entry;
+              also INSIDE the initramfs — interactive emergency console)
             * Power control: poler-powerctl (reboot/poweroff/halt marker IPC to PID 1)
             * Updater: poler-update 1.2.0 (`--install engine` sovereign channel)
-            * ISO: hybrid BIOS+UEFI, boot-verified in QEMU up to the Terminal Gateway
+            * REAL-HARDWARE BOOT: Ventoy ISO-file scan, NVMe/USB3/USB keyboards,
+              vfat/exFAT/NTFS/ext4, linux-firmware (GPU blobs purged — no
+              graphics stack), tty1-first consoles for the physical monitor
+            * ISO: hybrid BIOS+UEFI; QEMU-verified twice per build — classic
+              (dd/Rufus) AND Ventoy simulation (ISO as a file on vfat)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

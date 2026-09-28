@@ -1,13 +1,20 @@
 // POLER-INIT — sovereign PID 1 for POLER CachyOS Sovereign Edition
 // ============================================================================
 // Stage 1 (initramfs, argv[0]==/init): mount pseudo-fs, load kernel modules
-//   from modules.dep, scan block devices for the POLER boot medium (marker
-//   file /poler/live.squashfs), loop-mount the squashfs, move mounts and
-//   switch_root into the live system. Emergency poler-sh REPL on failure.
+//   from modules.dep, scan block devices for the POLER boot medium:
+//     a) direct medium (dd/Rufus/OptiDrive): a partition or whole disk
+//        carrying /poler/live.squashfs (iso9660/vfat/exfat/ntfs3/ext4/btrfs)
+//     b) ISO-FILE scan (Ventoy et al): a mounted filesystem carrying the
+//        distro .iso as a FILE — poler-init loop-mounts the ISO itself and
+//        reads live.squashfs out of it (poler.findiso=1 forces this path)
+//   Loop-mount the squashfs, move mounts and switch_root into the live
+//   system. Emergency poler-sh REPL on failure (poler-sh is shipped INSIDE
+//   the initramfs — a failed scan must never end in a dark crash loop).
 //
 // Stage 2 (live system, /sbin/init): mount writable tmpfs areas (/run, /tmp,
 //   /root — the live rootfs is read-only squashfs), then supervise terminal
-//   sessions on the console (+ tty2..tty4 when present):
+//   sessions on /dev/tty1 (physical monitor + keyboard — PRIMARY),
+//   /dev/console (serial — QEMU/CI, serial cables) and tty2..tty3:
 //     PRIMARY  : poler-engine --gateway  (Terminal Gateway from
 //                poler-engine-org/poler-engine, workspace root = cwd = "/")
 //     FALLBACK : poler-sh v0.2.0 (Kotokvit/poler-sh) — rescue/compat shell,
@@ -18,6 +25,14 @@
 //   (poler-powerctl) drop marker files into /run/poler/ — PID 1 polls them,
 //   so power control works from inside the engine Terminal Gateway (whose
 //   sandbox contour deliberately blocks destructive host shutdown calls).
+//
+// Console strategy for REAL hardware: the kernel cmdline declares
+//   console=tty0 console=ttyS0,115200n8 — /dev/console is therefore the
+//   SERIAL port (QEMU/CI verification reads it), while the physical monitor
+//   is /dev/tty0//tty1. log() therefore dual-writes (/dev/console for CI +
+//   /dev/tty0 for the human at the monitor), and interactive sessions are
+//   spawned on /dev/tty1 FIRST so the gateway is usable from the local
+//   keyboard — no more "blank screen / dark loop" on a real PC.
 //
 // Exit codes of poler-sh consumed here match sovereign/poler-sh-core.
 // No shell scripts, no systemd, no SysVinit glue: pure native Rust.
@@ -45,12 +60,15 @@ type IoctlReq = libc::c_int;
 type IoctlReq = libc::c_ulong;
 const LOOP_CTL_GET_FREE: IoctlReq = 0x4C82;
 const LOOP_SET_FD: IoctlReq = 0x4C00;
+const LOOP_CLR_FD: IoctlReq = 0x4C01;
 const INITRAMFS_MARKER: &str = "/.poler-initramfs";
 const ENGINE_BIN: &str = "/usr/bin/poler-engine";
 const RESCUE_SHELL_BIN: &str = "/usr/bin/poler-sh";
 const MARKER_DIR: &str = "/run/poler";
 const MARKER_REBOOT: &str = "/run/poler/reboot";
 const MARKER_POWEROFF: &str = "/run/poler/poweroff";
+const MEDIUM_MOUNT: &str = "/run/medium";
+const ISO_MOUNT: &str = "/run/iso";
 
 static PENDING_ACTION: AtomicI32 = AtomicI32::new(0); // 0 none, 1 reboot, 2 poweroff
 
@@ -71,9 +89,15 @@ fn main() {
 }
 
 fn log(msg: &str) {
-    // Best-effort logging to the kernel console.
+    // Dual-output logging. /dev/console is the LAST console= param (serial —
+    // that is what QEMU/CI verification reads); /dev/tty0 is the physical
+    // monitor on real hardware. Writing both means the human at the PC sees
+    // scan progress even though /dev/console points at an empty COM port.
     if let Ok(mut c) = OpenOptions::new().write(true).open("/dev/console") {
         let _ = writeln!(c, "\x1b[1;36mpoler-init\x1b[0m: {}", msg);
+    }
+    if let Ok(mut v) = OpenOptions::new().write(true).open("/dev/tty0") {
+        let _ = writeln!(v, "\x1b[1;36mpoler-init\x1b[0m: {}", msg);
     }
     let _ = writeln!(std::io::stderr(), "poler-init: {}", msg);
 }
@@ -96,16 +120,17 @@ fn initramfs_stage() -> ! {
 
     load_boot_modules(&kver, debug);
 
-    // Find the boot medium that carries /poler/live.squashfs.
-    let boot_dir = match find_boot_medium(&cmdline, debug) {
-        Some(d) => d,
+    // Find the boot medium: direct (dd/Rufus/optical) or ISO-file (Ventoy).
+    let medium = match find_boot_medium(&cmdline, debug) {
+        Some(m) => m,
         None => {
             log("\x1b[1;31mFATAL: boot medium with /poler/live.squashfs not found\x1b[0m");
+            log("insert the POLER USB stick / press 'exit 44' in the emergency console to rescan");
             emergency_shell("boot medium not found");
         }
     };
-    let squashfs = boot_dir.join("poler/live.squashfs");
-    log(format!("boot medium: {}", boot_dir.display()).as_str());
+    let squashfs = medium.squashfs.clone();
+    log(format!("boot medium: {}", medium.description).as_str());
 
     // Loop-mount the squashfs onto /mnt.
     if !mount_squashfs_loop(&squashfs, "/mnt") {
@@ -253,16 +278,26 @@ fn kernel_version() -> String {
 /// Static priority list of modules required to reach the boot medium.
 /// Names are REAL module names (as in modules.dep, dashes normalized to
 /// underscores). "isofs" is the module behind the iso9660 filesystem alias.
+/// KEEP IN SYNC with INITRAMFS_MODULES in builder/build_iso.py.
 const BOOT_MODULES: &[&str] = &[
     // SCSI core + CD-ROM + ISO9660/UDF (optical boot, incl. QEMU IDE cdrom)
     "scsi_mod", "cdrom", "sr_mod", "isofs", "udf",
-    // SATA/ATA (QEMU -cdrom default IDE: ata_piix + deps)
+    // SATA/ATA (QEMU -cdrom default IDE: ata_piix + deps; real AHCI disks)
     "ata_piix", "ata_generic", "libata", "ahci", "sd_mod",
-    // USB mass storage chain
-    "usb_common", "usbcore", "xhci_pci", "ehci_pci", "uhci_hcd",
+    // NVMe SSDs (modern real PCs)
+    "nvme", "nvme_core",
+    // USB hosts: USB1.1/2.0/3.x — real sticks on real PCs
+    "usb_common", "usbcore", "xhci_pci", "ehci_pci", "uhci_hcd", "ohci_pci",
     "usb_storage", "uas",
-    // FAT for USB sticks formatted vfat
-    "nls_cp437", "nls_iso8859_1", "vfat", "fat",
+    // Human input: USB keyboards on real PCs
+    "usbhid", "hid_generic",
+    // Flash-drive filesystems: FAT (dd sticks), exFAT (Ventoy default),
+    // NTFS (Ventoy alternative), ext4 (iso-on-ext4 test + power users)
+    "nls_cp437", "nls_iso8859_1", "nls_utf8", "vfat", "fat", "exfat", "ntfs3",
+    // SD/mmc readers (some laptops boot from SD)
+    "mmc_block", "sdhci", "sdhci_pci",
+    // virtio (KVM/QEMU direct-disk boots)
+    "virtio_pci", "virtio_blk", "virtio_scsi",
     // Live root
     "squashfs", "loop",
 ];
@@ -453,30 +488,50 @@ fn decompressed_insmod(path: &str) -> bool {
 
 // ------------------------- boot medium discovery ----------------------------
 
-fn find_boot_medium(cmdline: &str, debug: bool) -> Option<PathBuf> {
+/// A located live medium. `squashfs` is the file to loop-mount; the mounts
+/// backing it (MEDIUM_MOUNT and, for the ISO-file path, ISO_MOUNT) must stay
+/// alive — the loop device references the file through an open fd, so the
+/// squashfs root keeps working even after stage 2 shadows /run with tmpfs.
+struct FoundMedium {
+    squashfs: PathBuf,
+    description: String,
+}
+
+fn find_boot_medium(cmdline: &str, debug: bool) -> Option<FoundMedium> {
     // poler.root=/dev/xxx — explicit override.
+    let mut explicit: Option<String> = None;
+    // poler.findiso=1 — force the ISO-file scan path (skip direct media;
+    // used by the CI Ventoy-simulation test and by users whose direct
+    // medium is broken).
+    let findiso_only = cmdline.contains("poler.findiso");
     for token in cmdline.split_whitespace() {
         if let Some(dev) = token.strip_prefix("poler.root=") {
             let dev = dev.trim();
             if !dev.is_empty() {
-                log(format!("explicit poler.root={}", dev).as_str());
-                if let Some(d) = try_mount_medium(dev, debug) {
-                    return Some(d);
-                }
-                return None;
+                explicit = Some(dev.to_string());
             }
         }
     }
-    // Scan block devices for up to ~15 seconds (USB enumeration can be slow).
-    for attempt in 0..30 {
+    if let Some(dev) = explicit {
+        log(format!("explicit poler.root={}", dev).as_str());
+        return try_device(&dev, debug, false);
+    }
+    if findiso_only {
+        log("poler.findiso=1 — direct media bypassed, ISO-file scan only");
+    }
+    // Scan block devices for up to ~30 seconds (USB enumeration can be slow
+    // on real hardware — xHCI port probing, device firmware handshakes).
+    for attempt in 0..60 {
         let devices = list_block_devices();
         if attempt == 0 {
-            log(format!("scanning {} block device node(s) for POLER boot medium...", devices.len()).as_str());
+            log(format!("scanning {} block device node(s) for the POLER boot medium...", devices.len()).as_str());
+        } else if attempt % 10 == 0 {
+            log(format!("still scanning... ({} s)", attempt / 2).as_str());
         }
         if !devices.is_empty() {
             for dev in devices {
-                if let Some(d) = try_mount_medium(&dev, debug) {
-                    return Some(d);
+                if let Some(m) = try_device(&dev, debug, findiso_only) {
+                    return Some(m);
                 }
             }
         }
@@ -513,28 +568,46 @@ fn list_block_devices() -> Vec<String> {
     out
 }
 
-/// Try to mount `dev` read-only with likely filesystems and look for the
-/// POLER marker. Returns the mountpoint on success.
-fn try_mount_medium(dev: &str, debug: bool) -> Option<PathBuf> {
+/// Try one block device node as the POLER boot medium:
+///   1. mount it read-only with every likely filesystem;
+///   2. DIRECT hit: /poler/live.squashfs at the mount root (dd/Rufus sticks,
+///      optical media) — unless poler.findiso=1 skips direct media;
+///   3. ISO-FILE hit: scan the mounted filesystem for *.iso files (root +
+///      one directory deep), loop-mount each candidate and check for
+///      /poler/live.squashfs INSIDE the ISO (Ventoy keeps the distro ISO as
+///      a plain file on an exFAT/NTFS stick).
+/// Both the filesystem mount and (for the ISO path) the ISO loop mount stay
+/// alive — the squashfs loop references the file through an open fd.
+fn try_device(dev: &str, debug: bool, findiso_only: bool) -> Option<FoundMedium> {
     if !Path::new(dev).exists() {
         return None;
     }
-    let mnt = "/run/medium";
+    let mnt = MEDIUM_MOUNT;
     ensure_dir(mnt);
     // Already mounted? Unmount to retry cleanly.
     unsafe {
         libc::umount2(cstr(mnt).as_ptr(), libc::MNT_DETACH);
     }
-    for fs_type in ["iso9660", "udf", "vfat", "exfat", "ext4", "btrfs"] {
+    for fs_type in ["iso9660", "udf", "vfat", "exfat", "ntfs3", "ext4", "btrfs"] {
         let fst = CString::new(fs_type).unwrap();
         let rc = unsafe {
             libc::mount(cstr(dev).as_ptr(), cstr(mnt).as_ptr(), fst.as_ptr(),
                         libc::MS_RDONLY | libc::MS_NOSUID, std::ptr::null())
         };
         if rc == 0 {
-            let marker = Path::new(mnt).join("poler/live.squashfs");
-            if marker.exists() {
-                return Some(PathBuf::from(mnt));
+            // 1) direct medium (dd/Rufus/OptiDrive and optical media)
+            if !findiso_only {
+                let marker = Path::new(mnt).join("poler/live.squashfs");
+                if marker.exists() {
+                    return Some(FoundMedium {
+                        squashfs: marker,
+                        description: format!("{} mounted as {} (direct)", dev, fs_type),
+                    });
+                }
+            }
+            // 2) ISO-file scan (Ventoy: the distro ISO is a FILE on this fs)
+            if let Some(m) = scan_iso_files(mnt, dev, fs_type, debug) {
+                return Some(m);
             }
             unsafe {
                 libc::umount2(cstr(mnt).as_ptr(), 0);
@@ -546,6 +619,151 @@ fn try_mount_medium(dev: &str, debug: bool) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Scan a mounted filesystem for distro ISO files and loop-mount them.
+/// Depth: root + one directory level (covers Ventoy's default layout and
+/// users who keep ISOs in /isos/). Candidates are ranked: POLER-named first,
+/// then largest — a random small .iso must not shadow the distro image.
+fn scan_iso_files(mnt: &str, dev: &str, fs_type: &str, debug: bool) -> Option<FoundMedium> {
+    let mut candidates: Vec<(PathBuf, u64)> = Vec::new();
+    let root = Path::new(mnt);
+    if let Ok(entries) = fs::read_dir(root) {
+        let mut names: Vec<String> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        for name in names {
+            let path = root.join(&name);
+            if is_iso_name(&name) {
+                if let Ok(md) = fs::metadata(&path) {
+                    if md.is_file() {
+                        candidates.push((path.clone(), md.len()));
+                    }
+                }
+            } else if fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false) {
+                // one level deep
+                if let Ok(sub) = fs::read_dir(&path) {
+                    for e in sub.flatten() {
+                        let fname = e.file_name().to_string_lossy().to_string();
+                        if is_iso_name(&fname) {
+                            if let Ok(md) = fs::metadata(e.path()) {
+                                if md.is_file() {
+                                    candidates.push((e.path(), md.len()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    // rank: name contains "poler" first, then size desc; cap at 8
+    candidates.sort_by(|a, b| {
+        let ap = a.0.to_string_lossy().to_lowercase().contains("poler");
+        let bp = b.0.to_string_lossy().to_lowercase().contains("poler");
+        bp.cmp(&ap).then(b.1.cmp(&a.1))
+    });
+    candidates.truncate(8);
+    log(format!("iso-scan: {} mounted as {} — {} ISO file candidate(s) on it",
+                dev, fs_type, candidates.len()).as_str());
+
+    for (iso, size) in candidates {
+        if debug {
+            log(format!("iso-scan: trying {} ({:.1} MB)", iso.display(), size as f64 / 1e6).as_str());
+        }
+        ensure_dir(ISO_MOUNT);
+        unsafe {
+            libc::umount2(cstr(ISO_MOUNT).as_ptr(), libc::MNT_DETACH);
+        }
+        // loop-bind the ISO file itself
+        let loop_dev = match loop_bind_file(&iso) {
+            Some(l) => l,
+            None => {
+                if debug {
+                    log(format!("iso-scan: cannot loop-bind {}", iso.display()).as_str());
+                }
+                continue;
+            }
+        };
+        let rc = unsafe {
+            libc::mount(cstr(&loop_dev).as_ptr(), cstr(ISO_MOUNT).as_ptr(),
+                        b"iso9660\0".as_ptr() as *const libc::c_char,
+                        libc::MS_RDONLY | libc::MS_NOSUID, std::ptr::null())
+        };
+        if rc != 0 {
+            loop_release(&loop_dev);
+            if debug {
+                log(format!("iso-scan: mount {} as iso9660 failed (errno {})",
+                            loop_dev, unsafe { *libc::__errno_location() }).as_str());
+            }
+            continue;
+        }
+        let marker = Path::new(ISO_MOUNT).join("poler/live.squashfs");
+        if marker.exists() {
+            log(format!("iso-scan: loop-mounted {} via {} (Ventoy-style ISO-file boot)",
+                        iso.display(), loop_dev).as_str());
+            return Some(FoundMedium {
+                squashfs: marker,
+                description: format!("{} -> {} -> {} (ISO file {})",
+                                     dev, fs_type, loop_dev,
+                                     iso.file_name().map(|n| n.to_string_lossy().to_string())
+                                       .unwrap_or_default()),
+            });
+        }
+        // not our ISO inside — release and try the next candidate
+        unsafe {
+            libc::umount2(cstr(ISO_MOUNT).as_ptr(), 0);
+        }
+        loop_release(&loop_dev);
+    }
+    None
+}
+
+fn is_iso_name(name: &str) -> bool {
+    name.to_lowercase().ends_with(".iso") && name.len() > 4
+}
+
+/// Bind a file to a free loop device (LOOP_CTL_GET_FREE + LOOP_SET_FD).
+/// Returns the loop device path; the kernel keeps its own reference to the
+/// backing file, so callers may drop their fd afterwards.
+fn loop_bind_file(file: &Path) -> Option<String> {
+    let ctrl_path = "/dev/loop-control";
+    if !Path::new(ctrl_path).exists() {
+        unsafe {
+            let c = cstr(ctrl_path);
+            libc::mknod(c.as_ptr(), libc::S_IFCHR | 0o600, libc::makedev(10, 237));
+        }
+    }
+    let f = File::open(ctrl_path).ok()?;
+    let idx = unsafe { libc::ioctl(f.as_raw_fd(), LOOP_CTL_GET_FREE) };
+    if idx < 0 {
+        return None;
+    }
+    let dev = format!("/dev/loop{}", idx);
+    let sq = File::open(file).ok()?;
+    if let Ok(mut lf) = OpenOptions::new().read(true).write(true).open(&dev) {
+        let rc = unsafe { libc::ioctl(lf.as_raw_fd(), LOOP_SET_FD, sq.as_raw_fd()) };
+        if rc != 0 {
+            return None;
+        }
+        let _ = lf.seek(SeekFrom::Start(0));
+        return Some(dev);
+    }
+    None
+}
+
+/// Detach a loop device (LOOP_CLR_FD) after its mount was unmounted.
+fn loop_release(dev: &str) {
+    if let Ok(lf) = OpenOptions::new().read(true).write(true).open(dev) {
+        unsafe {
+            libc::ioctl(lf.as_raw_fd(), LOOP_CLR_FD);
+        }
+    }
 }
 
 // ------------------------------ loop + squashfs -----------------------------
@@ -671,6 +889,12 @@ fn system_stage() -> ! {
     // from any contour, including the sandboxed engine gateway.
     spawn_marker_poller();
 
+    // Secondary consoles (serial + extra VTs): background respawners,
+    // started ONCE — the supervision loop below only re-spawns the primary.
+    for tty in consoles.iter().skip(1) {
+        let _ = spawn_shell_wait(tty, false);
+    }
+
     let mut restarts: u32 = 0;
     loop {
         let action = PENDING_ACTION.load(Ordering::SeqCst);
@@ -681,9 +905,10 @@ fn system_stage() -> ! {
             do_poweroff();
         }
 
-        // Spawn shell on first console synchronously; others as background respawners.
+        // The primary console (tty1 on real hardware) is supervised
+        // synchronously by this loop.
         let primary = consoles[0].clone();
-        let code = spawn_shell_wait(&primary);
+        let code = spawn_shell_wait(&primary, true);
         match code {
             EXIT_REBOOT => do_reboot(),
             EXIT_POWEROFF => do_poweroff(),
@@ -701,8 +926,19 @@ fn system_stage() -> ! {
 }
 
 fn available_consoles() -> Vec<String> {
-    let mut out = vec!["/dev/console".to_string()];
-    for tty in ["/dev/tty2", "/dev/tty3", "/dev/tty4"] {
+    let mut out = Vec::new();
+    // PHYSICAL MONITOR FIRST: /dev/tty1 is the foreground VT on real
+    // hardware — the engine Terminal Gateway there is interactive with the
+    // local keyboard. (v1.2.0 spawned only on /dev/console = serial →
+    // blank screen + dead keyboard on a real PC. Never again.)
+    if Path::new("/dev/tty1").exists() {
+        out.push("/dev/tty1".to_string());
+    }
+    // Serial console: /dev/console is the LAST console= param (ttyS0) —
+    // this is the QEMU/CI verification channel and serial-cable access.
+    out.push("/dev/console".to_string());
+    // Extra local VTs for Alt+F2/F3.
+    for tty in ["/dev/tty2", "/dev/tty3"] {
         if Path::new(tty).exists() {
             out.push(tty.to_string());
         }
@@ -711,11 +947,16 @@ fn available_consoles() -> Vec<String> {
 }
 
 fn banner() {
-    if let Ok(mut c) = OpenOptions::new().write(true).open("/dev/console") {
-        let _ = writeln!(c, "\x1b[1;36m╭─────────────────────────────────────────────────────╮\x1b[0m");
-        let _ = writeln!(c, "\x1b[1;36m│\x1b[0m \x1b[1;37mPOLER CachyOS Sovereign Edition\x1b[0m              \x1b[1;36m│\x1b[0m");
-        let _ = writeln!(c, "\x1b[1;36m│\x1b[0m \x1b[1;33mpoler-init PID 1 · poler-engine Terminal Gateway\x1b[0m \x1b[1;36m│\x1b[0m");
-        let _ = writeln!(c, "\x1b[1;36m╰─────────────────────────────────────────────────────╯\x1b[0m");
+    // The banner must reach the HUMAN: /dev/tty1 = physical monitor,
+    // /dev/console = serial (QEMU/CI). Dual-write both.
+    for tty in ["/dev/tty1", "/dev/console"] {
+        if let Ok(mut c) = OpenOptions::new().write(true).open(tty) {
+            let _ = writeln!(c, "\x1b[1;36m╭─────────────────────────────────────────────────────╮\x1b[0m");
+            let _ = writeln!(c, "\x1b[1;36m│\x1b[0m \x1b[1;37mPOLER CachyOS Sovereign Edition\x1b[0m              \x1b[1;36m│\x1b[0m");
+            let _ = writeln!(c, "\x1b[1;36m│\x1b[0m \x1b[1;33mpoler-init PID 1 · poler-engine Terminal Gateway\x1b[0m \x1b[1;36m│\x1b[0m");
+            let _ = writeln!(c, "\x1b[1;36m╰─────────────────────────────────────────────────────╯\x1b[0m");
+            let _ = writeln!(c, "interactive terminal: this monitor (tty1) · Alt+F2/F3 for more");
+        }
     }
 }
 
@@ -771,9 +1012,11 @@ fn spawn_marker_poller() {
     });
 }
 
-fn spawn_shell_wait(tty: &str) -> i32 {
+fn spawn_shell_wait(tty: &str, is_primary: bool) -> i32 {
     // Background TTYs: spawn detached respawner threads (best effort).
-    if tty != "/dev/console" {
+    // The FIRST console (tty1 on real hardware) is supervised synchronously
+    // by the main loop; the rest respawn in the background.
+    if !is_primary {
         let tty = tty.to_string();
         thread::spawn(move || loop {
             let _ = spawn_shell_once(&tty);
@@ -893,12 +1136,25 @@ fn do_poweroff() -> ! {
 
 fn emergency_shell(reason: &str) -> ! {
     log(format!("EMERGENCY shell ({})", reason).as_str());
-    if let Ok(mut c) = OpenOptions::new().write(true).open("/dev/console") {
-        let _ = writeln!(c, "\x1b[1;31mPOLER EMERGENCY MODE: {}\x1b[0m", reason);
-        let _ = writeln!(c, "Starting poler-sh on console. Fix the problem and type 'exit 44' to retry boot.\x1b[0m");
+    // The banner must reach the HUMAN on the physical monitor — /dev/tty1
+    // first, /dev/tty0 and /dev/console (serial) as fallbacks. v1.2.0 wrote
+    // only to /dev/console (= an empty COM port on a real PC) and spawned a
+    // shell binary that did not exist in the initramfs → an invisible dark
+    // loop on real hardware. Never again.
+    for tty in ["/dev/tty1", "/dev/tty0", "/dev/console"] {
+        if let Ok(mut c) = OpenOptions::new().write(true).open(tty) {
+            let _ = writeln!(c, "\x1b[1;31m╔════════════════════════════════════════════════════╗\x1b[0m");
+            let _ = writeln!(c, "\x1b[1;31m║          POLER EMERGENCY MODE (initramfs)          ║\x1b[0m");
+            let _ = writeln!(c, "\x1b[1;31m╚════════════════════════════════════════════════════╝\x1b[0m");
+            let _ = writeln!(c, "причина / reason: {}", reason);
+            let _ = writeln!(c, "Запускается poler-sh — аварийная консоль прямо из initramfs.");
+            let _ = writeln!(c, "Введите 'exit 44' — загрузка повторится заново (rescan USB).");
+            let _ = writeln!(c, "'exit 42' = reboot · 'exit 43' = poweroff\x1b[0m");
+        }
     }
+    let mut dark_iterations: u32 = 0;
     loop {
-        let code = run_shell_stdio();
+        let code = run_emergency_shell();
         if code == 44 {
             // retry the whole boot path
             log("retry requested — re-entering initramfs stage");
@@ -910,9 +1166,47 @@ fn emergency_shell(reason: &str) -> ! {
         if code == EXIT_POWEROFF {
             do_poweroff();
         }
-        // no shell available (or it exited) — avoid a log flood
+        // No shell ran (binary missing / spawn failed) — heartbeat instead
+        // of a silent sleep, so both the monitor and the serial log see it.
+        dark_iterations += 1;
+        if dark_iterations % 8 == 1 {
+            let why = if Path::new(RESCUE_SHELL_BIN).exists() {
+                "spawn failed"
+            } else {
+                "poler-sh binary absent from initramfs (broken image)"
+            };
+            log(format!("emergency: shell did not start ({}) — retrying; reason: {}", why, reason).as_str());
+        }
         thread::sleep(Duration::from_millis(700));
     }
+}
+
+/// Emergency REPL: poler-sh with stdio on the physical monitor (tty1),
+/// falling back to /dev/console (serial) and finally to inherited stdio.
+/// poler-sh is shipped INSIDE the initramfs by the builder — see
+/// stage_initramfs() in build_iso.py (static musl, or glibc + libs).
+fn run_emergency_shell() -> i32 {
+    for tty in ["/dev/tty1", "/dev/console"] {
+        if let Ok(console) = OpenOptions::new().read(true).write(true).open(tty) {
+            let child = Command::new(RESCUE_SHELL_BIN)
+                .env("HOME", "/root")
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .env("TERM", "linux")
+                .env("SHELL", RESCUE_SHELL_BIN)
+                .env("USER", "root")
+                .env("POLER_INIT", "1")
+                .env("POLER_EMERGENCY", "1")
+                .stdin(Stdio::from(console.try_clone().unwrap()))
+                .stdout(Stdio::from(console.try_clone().unwrap()))
+                .stderr(Stdio::from(console))
+                .status();
+            match child {
+                Ok(s) => return s.code().unwrap_or(0),
+                Err(_) => continue, // binary missing here — try the next tty
+            }
+        }
+    }
+    run_shell_stdio()
 }
 
 // --------------------------------- helpers ----------------------------------
