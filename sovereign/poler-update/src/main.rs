@@ -99,19 +99,23 @@ fn json_string_field(text: &str, key: &str) -> Option<String> {
 /// Extracts (name, browser_download_url) pairs from a GitHub release JSON.
 fn release_assets(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    let tag = json_string_field(text, "tag_name").unwrap_or_else(|| "v1.1.0".to_string());
+
+    // Search for each asset block starting with "\"name\":"
     let mut idx = 0;
-    while let Some(pos) = text[idx..].find("\"browser_download_url\"") {
+    while let Some(pos) = text[idx..].find("\"name\"") {
         let block_start = idx + pos;
-        // walk back to the opening '{' of this asset object
-        let obj_start = text[..block_start].rfind('{').unwrap_or(0);
-        // find the closing '}' after the url
-        let url_after = &text[block_start..];
-        let url = json_string_field(url_after, "browser_download_url").unwrap_or_default();
-        let name = json_string_field(&text[obj_start..block_start + 40], "name")
-            .or_else(|| json_string_field(url_after, "name"))
-            .unwrap_or_default();
-        if !url.is_empty() {
-            out.push((name, url));
+        let chunk = &text[block_start..];
+        let name = json_string_field(chunk, "name").unwrap_or_default();
+        if !name.is_empty() && (name.ends_with(".tar.gz") || name.ends_with(".iso") || name == "SHA256SUMS" || name == "manifest.json") {
+            let url = if let Some(download_url) = json_string_field(chunk, "browser_download_url") {
+                download_url
+            } else {
+                format!("https://github.com/Kotokvit/poler-distro/releases/download/{}/{}", tag, name)
+            };
+            if !out.iter().any(|(n, _): &(String, String)| n == &name) {
+                out.push((name, url));
+            }
         }
         idx = block_start + 10;
     }
@@ -305,26 +309,38 @@ fn main() {
         std::process::exit(err("tar extraction failed"));
     }
 
+    extern "C" {
+        fn geteuid() -> u32;
+    }
+    let is_root = unsafe { geteuid() == 0 };
+    let user_home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let user_bin_dir = PathBuf::from(&user_home).join(".local/bin");
+    let _ = fs::create_dir_all(&user_bin_dir);
+
     // Atomic install
     let mut installed = 0;
     for (name, dest) in INSTALL_MAP {
         let staged = find_staged(&extract_dir, name);
         if let Some(src) = staged {
-            let dest = Path::new(dest);
-            if let Some(parent) = dest.parent() {
+            let dest_path = if is_root {
+                PathBuf::from(dest)
+            } else {
+                user_bin_dir.join(name)
+            };
+            if let Some(parent) = dest_path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            let tmp = dest.with_extension("new");
+            let tmp = dest_path.with_extension("new");
             if fs::copy(&src, &tmp).is_err() {
-                std::process::exit(err(&format!("cannot stage {}", dest.display())));
+                std::process::exit(err(&format!("cannot stage {}", dest_path.display())));
             }
             set_exec(&tmp);
-            if fs::rename(&tmp, dest).is_err() {
+            if fs::rename(&tmp, &dest_path).is_err() {
                 let _ = fs::remove_file(&tmp);
-                std::process::exit(err(&format!("cannot atomically install {} (running binary?) — retry after reboot", dest.display())));
+                std::process::exit(err(&format!("cannot atomically install {} (running binary?) — retry after reboot", dest_path.display())));
             }
             installed += 1;
-            log(&format!("installed \x1b[1;32m{}\x1b[0m -> {}", name, dest.display()));
+            log(&format!("installed \x1b[1;32m{}\x1b[0m -> {}", name, dest_path.display()));
         } else {
             log(&format!("\x1b[1;33mcomponent {} not present in release archive\x1b[0m", name));
         }
