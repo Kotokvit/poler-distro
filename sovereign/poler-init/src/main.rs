@@ -5,10 +5,19 @@
 //   file /poler/live.squashfs), loop-mount the squashfs, move mounts and
 //   switch_root into the live system. Emergency poler-sh REPL on failure.
 //
-// Stage 2 (live system, /sbin/init): supervise poler-sh sessions on the
-//   console (+ tty2..tty4 when present), respawn on exit, honor exit codes:
-//     42 -> reboot    43 -> poweroff
+// Stage 2 (live system, /sbin/init): mount writable tmpfs areas (/run, /tmp,
+//   /root — the live rootfs is read-only squashfs), then supervise terminal
+//   sessions on the console (+ tty2..tty4 when present):
+//     PRIMARY  : poler-engine --gateway  (Terminal Gateway from
+//                poler-engine-org/poler-engine, workspace root = cwd = "/")
+//     FALLBACK : poler-sh v0.2.0 (Kotokvit/poler-sh) — rescue/compat shell,
+//                also the #!/bin/sh compatibility layer of the image
+//   Respawn on exit, honor exit codes:  42 -> reboot    43 -> poweroff
 //   Signals: SIGINT/SIGTERM/SIGUSR1 -> reboot; SIGUSR2/SIGQUIT -> poweroff.
+//   Sovereign power control: /usr/bin/reboot + /usr/bin/poweroff
+//   (poler-powerctl) drop marker files into /run/poler/ — PID 1 polls them,
+//   so power control works from inside the engine Terminal Gateway (whose
+//   sandbox contour deliberately blocks destructive host shutdown calls).
 //
 // Exit codes of poler-sh consumed here match sovereign/poler-sh-core.
 // No shell scripts, no systemd, no SysVinit glue: pure native Rust.
@@ -37,6 +46,11 @@ type IoctlReq = libc::c_ulong;
 const LOOP_CTL_GET_FREE: IoctlReq = 0x4C82;
 const LOOP_SET_FD: IoctlReq = 0x4C00;
 const INITRAMFS_MARKER: &str = "/.poler-initramfs";
+const ENGINE_BIN: &str = "/usr/bin/poler-engine";
+const RESCUE_SHELL_BIN: &str = "/usr/bin/poler-sh";
+const MARKER_DIR: &str = "/run/poler";
+const MARKER_REBOOT: &str = "/run/poler/reboot";
+const MARKER_POWEROFF: &str = "/run/poler/poweroff";
 
 static PENDING_ACTION: AtomicI32 = AtomicI32::new(0); // 0 none, 1 reboot, 2 poweroff
 
@@ -617,6 +631,11 @@ fn system_stage() -> ! {
         mount_early_pseudo_fs();
     }
 
+    // Writable areas for the live system: the rootfs is read-only squashfs,
+    // but the engine Terminal Gateway wants $HOME/.cache for command
+    // history, and sovereign power control needs /run/poler markers.
+    mount_writable_tmpfs();
+
     // Hostname
     let _ = fs::write("/proc/sys/kernel/hostname", "poler-cachyos\n");
 
@@ -636,7 +655,21 @@ fn system_stage() -> ! {
 
     // Supervision loop on the console (and extra TTYs when present).
     let consoles = available_consoles();
-    log(format!("supervising {} poler-sh session(s): {:?}", consoles.len(), consoles).as_str());
+    // poler.rescue=1 on the kernel cmdline forces the poler-sh rescue shell
+    // (bypasses the engine Terminal Gateway — GRUB ships such an entry).
+    let rescue = fs::read_to_string("/proc/cmdline")
+        .map(|c| c.contains("poler.rescue"))
+        .unwrap_or(false);
+    if rescue {
+        log("poler.rescue=1 — engine bypassed, poler-sh rescue console");
+    }
+    log(format!("supervising {} terminal session(s): {:?} — primary: poler-engine Terminal Gateway, fallback: poler-sh",
+                consoles.len(), consoles).as_str());
+
+    // Sovereign power control: poll /run/poler marker files written by
+    // poler-powerctl (/usr/bin/reboot, /usr/bin/poweroff) so shutdown works
+    // from any contour, including the sandboxed engine gateway.
+    spawn_marker_poller();
 
     let mut restarts: u32 = 0;
     loop {
@@ -681,9 +714,61 @@ fn banner() {
     if let Ok(mut c) = OpenOptions::new().write(true).open("/dev/console") {
         let _ = writeln!(c, "\x1b[1;36m╭─────────────────────────────────────────────────────╮\x1b[0m");
         let _ = writeln!(c, "\x1b[1;36m│\x1b[0m \x1b[1;37mPOLER CachyOS Sovereign Edition\x1b[0m              \x1b[1;36m│\x1b[0m");
-        let _ = writeln!(c, "\x1b[1;36m│\x1b[0m \x1b[1;33mpoler-init PID 1 · poler-sh · bash purged\x1b[0m       \x1b[1;36m│\x1b[0m");
+        let _ = writeln!(c, "\x1b[1;36m│\x1b[0m \x1b[1;33mpoler-init PID 1 · poler-engine Terminal Gateway\x1b[0m \x1b[1;36m│\x1b[0m");
         let _ = writeln!(c, "\x1b[1;36m╰─────────────────────────────────────────────────────╯\x1b[0m");
     }
+}
+
+/// Mount tmpfs on the writable areas of the live system. The rootfs is a
+/// read-only squashfs; without these the engine cannot persist command
+/// history under $HOME/.cache and poler-powerctl cannot drop markers.
+/// mode=0755,size=… keeps the RAM footprint bounded on small machines.
+fn mount_writable_tmpfs() {
+    for (dir, opts) in [
+        ("/run", "size=16m,mode=0755"),
+        ("/tmp", "size=256m,mode=1777"),
+        ("/root", "size=64m,mode=0700"),
+    ] {
+        let _ = fs::create_dir_all(dir);
+        let src = CString::new("tmpfs").unwrap();
+        let tgt = CString::new(dir).unwrap();
+        let data = CString::new(opts).unwrap();
+        let rc = unsafe {
+            libc::mount(src.as_ptr(), tgt.as_ptr(), b"tmpfs\0".as_ptr() as *const libc::c_char,
+                        0, data.as_ptr() as *const libc::c_void)
+        };
+        if rc == 0 {
+            log(format!("tmpfs mounted on {} ({})", dir, opts).as_str());
+        } else {
+            // EBUSY = already mounted (e.g. defensive mount earlier) — fine.
+            let errno = unsafe { *libc::__errno_location() };
+            if errno != libc::EBUSY {
+                log(format!("warn: tmpfs on {} failed (errno {}) — live area stays read-only", dir, errno).as_str());
+            }
+        }
+    }
+    let _ = fs::create_dir_all(MARKER_DIR);
+}
+
+/// Background poller for sovereign power-control marker files. The engine
+/// Terminal Gateway sandbox deliberately blocks destructive host commands
+/// (shutdown/halt), and there are no systemd binaries in the image anyway;
+/// /usr/bin/reboot + /usr/bin/poweroff (poler-powerctl) therefore write a
+/// marker into /run/poler/ and PID 1 performs the requested action.
+fn spawn_marker_poller() {
+    thread::spawn(|| loop {
+        if Path::new(MARKER_REBOOT).exists() {
+            let _ = fs::remove_file(MARKER_REBOOT);
+            log("power marker: reboot requested (poler-powerctl)");
+            PENDING_ACTION.store(1, Ordering::SeqCst);
+        }
+        if Path::new(MARKER_POWEROFF).exists() {
+            let _ = fs::remove_file(MARKER_POWEROFF);
+            log("power marker: poweroff requested (poler-powerctl)");
+            PENDING_ACTION.store(2, Ordering::SeqCst);
+        }
+        thread::sleep(Duration::from_millis(300));
+    });
 }
 
 fn spawn_shell_wait(tty: &str) -> i32 {
@@ -707,11 +792,51 @@ fn spawn_shell_once(tty: &str) -> i32 {
             return run_shell_stdio();
         }
     };
-    let mut child = match Command::new("/usr/bin/poler-sh")
+    // PRIMARY: poler-engine Terminal Gateway (the sovereign shell of
+    // poler-engine-org/poler-engine). cwd = "/" makes the whole live system
+    // the workspace root, so the Workspace Boundary Guard never prompts on
+    // the live console (there is nothing outside the workspace to guard).
+    // poler.rescue=1 bypasses the engine entirely (rescue console).
+    let rescue = fs::read_to_string("/proc/cmdline")
+        .map(|c| c.contains("poler.rescue"))
+        .unwrap_or(false);
+    if !rescue && Path::new(ENGINE_BIN).exists() {
+        let child = Command::new(ENGINE_BIN)
+            .arg("--gateway")
+            .current_dir("/")
+            .env("HOME", "/root")
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("TERM", "linux")
+            .env("SHELL", ENGINE_BIN)
+            .env("USER", "root")
+            .env("POLER_INIT", "1")
+            .stdin(Stdio::from(console.try_clone().unwrap()))
+            .stdout(Stdio::from(console.try_clone().unwrap()))
+            .stderr(Stdio::from(console.try_clone().unwrap()))
+            .spawn();
+        match child {
+            Ok(mut c) => {
+                let code = match c.wait() {
+                    Ok(status) => status.code().unwrap_or(0),
+                    Err(_) => 0,
+                };
+                // poler-sh rescue contract: 42 reboot / 43 poweroff.
+                // The engine gateway exits 0 on `quit`; honor both.
+                return code;
+            }
+            Err(e) => {
+                log(format!("cannot spawn {}: {} — falling back to poler-sh", ENGINE_BIN, e).as_str());
+            }
+        }
+    } else {
+        log("poler-engine not present in image — poler-sh rescue shell");
+    }
+    // FALLBACK: poler-sh (rescue/compat shell of the image).
+    let mut child = match Command::new(RESCUE_SHELL_BIN)
         .env("HOME", "/root")
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .env("TERM", "linux")
-        .env("SHELL", "/usr/bin/poler-sh")
+        .env("SHELL", RESCUE_SHELL_BIN)
         .env("USER", "root")
         .env("POLER_INIT", "1")
         .stdin(Stdio::from(console.try_clone().unwrap()))

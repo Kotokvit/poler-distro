@@ -6,6 +6,13 @@
 //   poler-update            — report mode: show mirror state vs local state
 //   poler-update --apply    — download + verify + atomically install the
 //                             sovereign core stack from the latest release
+//   poler-update --install engine
+//                           — sovereign engine channel: download the OFFICIAL
+//                             poler-engine release binary (poler-engine-org/
+//                             poler-engine, sha256-pinned) and install it
+//                             atomically. The engine's Terminal Gateway is
+//                             the primary shell of the live ISO; this command
+//                             brings it to any installed system.
 //   poler-update --help
 //
 // Design (zero legacy):
@@ -33,12 +40,23 @@ const CORE_ASSET: &str = "poler-core-x86_64.tar.gz";
 // Sovereign stack installed by --apply (name in archive -> absolute path).
 const INSTALL_MAP: &[(&str, &str)] = &[
     ("poler-init", "/usr/bin/poler-init"),
+    ("poler-powerctl", "/usr/bin/poler-powerctl"),
     ("poler-sh", "/usr/bin/poler-sh"),
     ("poler", "/usr/bin/poler"),
     ("poler-box", "/usr/bin/poler-box"),
     ("poler-fuse", "/usr/bin/poler-fuse"),
     ("poler-update", "/usr/bin/poler-update"),
 ];
+
+// Sovereign engine — official release channel. The engine is the crown jewel:
+// NEVER rebuilt from source, always the official release binary, pinned by
+// sha256. Keep this pin in sync with builder/build_iso.py (ENGINE_SHA256).
+const ENGINE_VERSION: &str = "0.61.0";
+const ENGINE_URL: &str =
+    "https://github.com/poler-engine-org/poler-engine/releases/download/v0.61.0/poler-engine";
+const ENGINE_SHA256: &str =
+    "abd6e98b47b6282e929a6ddd6e7172c76c88e10ec5d45dce0d88a0388117b547";
+const ENGINE_DEST: &str = "/usr/bin/poler-engine";
 
 fn log(msg: &str) {
     println!("\x1b[1;36m[POLER-UPDATE]\x1b[0m {}", msg);
@@ -56,10 +74,14 @@ fn err(msg: &str) -> i32 {
 fn usage() {
     println!("poler-update — POLER sovereign mirror synchronizer");
     println!();
-    println!("  poler-update             report mirror state vs this system");
-    println!("  poler-update --apply     download, verify and install the latest");
-    println!("                           sovereign core stack from GitHub");
-    println!("  poler-update --help      this help");
+    println!("  poler-update                  report mirror state vs this system");
+    println!("  poler-update --apply          download, verify and install the latest");
+    println!("                                sovereign core stack from GitHub");
+    println!("  poler-update --install engine install the OFFICIAL poler-engine");
+    println!("                                release (poler-engine-org/poler-engine,");
+    println!("                                v{}, sha256-pinned) — its Terminal", ENGINE_VERSION);
+    println!("                                Gateway becomes the system shell");
+    println!("  poler-update --help           this help");
 }
 
 // --------------------------- minimal JSON scanning ---------------------------
@@ -177,6 +199,17 @@ fn main() {
         return;
     }
     let apply = args.iter().any(|a| a == "--apply" || a == "-y");
+
+    // Sovereign engine channel: `poler-update --install engine`.
+    if let Some(pos) = args.iter().position(|a| a == "--install") {
+        let module = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("");
+        match module {
+            "engine" => std::process::exit(install_engine()),
+            other => std::process::exit(err(&format!(
+                "module '{}' has no sovereign release channel yet (engine: OK; mesh/git/edit: planned)",
+                other))),
+        }
+    }
 
     log("Connecting to sovereign GitHub mirror: https://github.com/Kotokvit/poler-distro ...");
 
@@ -363,6 +396,68 @@ fn main() {
     ok(&format!(
         "✓ Sovereign stack updated to {} ({} components) — система синхронизирована с вашим GitHub-зеркалом!",
         remote_version, installed));
+}
+
+/// Sovereign engine channel: download the official release binary, verify the
+/// pinned sha256, install atomically. The engine is never rebuilt from source
+/// — this is the same binary that powers the live ISO console (builder/
+/// build_iso.py pins the identical sha256).
+fn install_engine() -> i32 {
+    log(&format!(
+        "sovereign engine channel: poler-engine-org/poler-engine v{} (official release, sha256-pinned)",
+        ENGINE_VERSION));
+
+    let stage_root = PathBuf::from(STAGE_DIR);
+    let _ = fs::remove_dir_all(&stage_root);
+    if fs::create_dir_all(&stage_root).is_err() {
+        return err("cannot create staging dir /tmp/poler-update.d");
+    }
+    let staged = stage_root.join("poler-engine");
+
+    log(&format!("Downloading official engine release ..."));
+    if let Err(e) = curl_to(ENGINE_URL, &staged) {
+        return err(&e);
+    }
+
+    let digest = match sha256_of(&staged) {
+        Ok(s) => s,
+        Err(e) => return err(&e),
+    };
+    if digest != ENGINE_SHA256 {
+        return err(&format!(
+            "sha256 MISMATCH for poler-engine: expected {}, got {} — refusing to install an unverified engine",
+            ENGINE_SHA256, digest));
+    }
+    log(&format!("sha256 verified: {}", &digest[..16.min(digest.len())]));
+
+    let dest = Path::new(ENGINE_DEST);
+    if let Some(parent) = dest.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let tmp = dest.with_extension("engine.new");
+    if fs::copy(&staged, &tmp).is_err() {
+        return err(&format!("cannot stage {}", tmp.display()));
+    }
+    set_exec(&tmp);
+    if fs::rename(&tmp, dest).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return err(&format!(
+            "cannot atomically install {} (engine running?) — quit the engine sessions and retry",
+            dest.display()));
+    }
+    let _ = fs::remove_dir_all(&stage_root);
+
+    ok(&format!(
+        "✓ poler-engine v{} installed -> {} — Terminal Gateway of the live ISO",
+        ENGINE_VERSION, ENGINE_DEST));
+    println!();
+    log("Try it safely FIRST:  poler-engine --shell        (interactive REPL)");
+    log("                    poler-engine --gateway      (full contour: pipes, redirects)");
+    println!();
+    log("\x1b[1;33mSAFETY: before making the engine a login shell, verify it works in your");
+    log("terminal AND keep a fallback shell line in /etc/passwd. NEVER leave the");
+    log("system with a single unverified login shell — that is how a 3-hour lockout happens.\x1b[0m");
+    0
 }
 
 fn find_staged(root: &Path, name: &str) -> Option<PathBuf> {

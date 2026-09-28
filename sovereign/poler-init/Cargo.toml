@@ -1,13 +1,17 @@
 [package]
 name = "poler-init"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "POLER-INIT — sovereign PID 1 for POLER CachyOS Sovereign Edition. Initramfs stage (module loading, boot medium scan, squashfs+loop, switch_root) and system stage (poler-sh console supervision, respawn, reboot/poweroff)."
+description = "POLER-INIT — sovereign PID 1 for POLER CachyOS Sovereign Edition. Initramfs stage (module loading, boot medium scan, squashfs+loop, switch_root) and system stage (poler-engine Terminal Gateway console supervision with poler-sh fallback, writable tmpfs areas, marker-file power control, respawn, reboot/poweroff)."
 license = "MIT"
 
 [[bin]]
 name = "poler-init"
 path = "src/main.rs"
+
+[[bin]]
+name = "poler-powerctl"
+path = "src/bin/powerctl.rs"
 
 [dependencies]
 libc = "0.2"

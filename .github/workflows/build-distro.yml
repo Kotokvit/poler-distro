@@ -10,7 +10,11 @@ permissions:
   contents: write
 
 env:
-  DISTRO_VERSION: "1.1.0"
+  DISTRO_VERSION: "1.2.0"
+  # The sovereign engine is fetched as the OFFICIAL release binary (never
+  # rebuilt from 389 MB of sources in CI) — build_iso.py pins its sha256:
+  #   v0.61.0 / abd6e98b47b6282e929a6ddd6e7172c76c88e10ec5d45dce0d88a0388117b547
+  ENGINE_RELEASE: "https://github.com/poler-engine-org/poler-engine/releases/download/v0.61.0/poler-engine"
 
 jobs:
   build-iso:
@@ -42,18 +46,21 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build sovereign poler-init (static musl) and poler-update
+      - name: Build sovereign poler-init + poler-powerctl (static musl) and poler-update
         run: |
           set -e
           mkdir -p binaries
           rustup target add x86_64-unknown-linux-musl
-          # poler-init = PID 1: STATIC musl build — zero interpreter deps in
-          # both the initramfs and the live system.
+          # poler-init = PID 1, poler-powerctl = reboot/poweroff marker IPC:
+          # both are STATIC musl builds — zero interpreter deps in both the
+          # initramfs and the live system.
           (cd sovereign/poler-init && cargo build --release --target x86_64-unknown-linux-musl)
           cp sovereign/poler-init/target/x86_64-unknown-linux-musl/release/poler-init binaries/
+          cp sovereign/poler-init/target/x86_64-unknown-linux-musl/release/poler-powerctl binaries/
           (cd sovereign/poler-update && cargo build --release)
           cp sovereign/poler-update/target/release/poler-update binaries/
           file binaries/poler-init | grep -q statically || echo "WARN: poler-init not static"
+          file binaries/poler-powerctl | grep -q statically || echo "WARN: poler-powerctl not static"
 
       - name: Build poler-sh from Kotokvit/poler-sh
         run: |
@@ -83,10 +90,10 @@ jobs:
         run: |
           set -e
           ls -la binaries/
-          file binaries/poler-init binaries/poler-sh | sed 's/,/\n  /g'
+          file binaries/poler-init binaries/poler-powerctl binaries/poler-sh | sed 's/,/\n  /g'
           binaries/poler-sh -c "echo bash-is-gone-sovereign-OK"
 
-      - name: Build the POLER CachyOS x86_64 ISO
+      - name: Build the POLER CachyOS x86_64 ISO (engine = primary console shell)
         run: |
           set -e
           # reclaim disk occupied by intermediate cargo builds
@@ -106,12 +113,15 @@ jobs:
         run: |
           set -e
           cd binaries
+          # NOTE: poler-engine is deliberately NOT in the core tarball — the
+          # engine is installed by its own sovereign release channel
+          # (`poler-update --install engine`, sha256-pinned), not redistributed.
           if [ -f poler-fuse ]; then
             tar -czf "$GITHUB_WORKSPACE/out/poler-core-x86_64.tar.gz" \
-              poler-init poler-sh poler poler-box poler-fuse poler-update
+              poler-init poler-powerctl poler-sh poler poler-box poler-fuse poler-update
           else
             tar -czf "$GITHUB_WORKSPACE/out/poler-core-x86_64.tar.gz" \
-              poler-init poler-sh poler poler-box poler-update
+              poler-init poler-powerctl poler-sh poler poler-box poler-update
           fi
           cd "$GITHUB_WORKSPACE"
           cp manifest.json out/
@@ -138,12 +148,15 @@ jobs:
             out/manifest.json
             out/SHA256SUMS
           body: |
-            POLER CachyOS Sovereign Edition ${{ env.DISTRO_VERSION }}
+            POLER CachyOS Sovereign Edition ${{ env.DISTRO_VERSION }} — engine as the console
 
             * Base: CachyOS x86_64 (linux-cachyos kernel, sovereign mirrors)
-            * PID 1: poler-init (no systemd)
-            * Shell: poler-sh 0.2.0 (no bash in the image)
-            * Updater: poler-update (direct GitHub sync, sha256-verified)
-            * ISO: hybrid BIOS+UEFI, boot-verified in QEMU
+            * PID 1: poler-init v0.3.0 (no systemd) — engine supervision + rescue
+            * Primary console shell: poler-engine v0.61.0 Terminal Gateway
+              (official release binary, sha256-pinned; pipes, redirects, native retrieval)
+            * Fallback/rescue shell: poler-sh 0.2.0 (`poler.rescue=1` GRUB entry)
+            * Power control: poler-powerctl (reboot/poweroff/halt marker IPC to PID 1)
+            * Updater: poler-update 1.2.0 (`--install engine` sovereign channel)
+            * ISO: hybrid BIOS+UEFI, boot-verified in QEMU up to the Terminal Gateway
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

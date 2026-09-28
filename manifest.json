@@ -1,26 +1,36 @@
 {
   "distro_name": "POLER CachyOS Sovereign Edition",
   "base_os": "CachyOS Linux x86_64",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "upstream_kernel": "linux-cachyos",
-  "iso": "poler-cachyos-x86_64-1.1.0.iso",
-  "iso_boot": "GRUB hybrid BIOS+UEFI, QEMU-verified boot chain",
+  "iso": "poler-cachyos-x86_64-1.2.0.iso",
+  "iso_boot": "GRUB hybrid BIOS+UEFI (sovereign + rescue entries), QEMU-verified boot chain",
   "core_stack": {
-    "init": "poler-init v0.2.0 (PID 1 sovereign boot supervisor: initramfs + system stages)",
-    "shell": "poler-sh v0.2.0 (Sovereign Shell, AST Math Gateway, from Kotokvit/poler-sh)",
+    "init": "poler-init v0.3.0 (PID 1 sovereign boot supervisor: initramfs + system stages, engine supervision, poler.rescue=1 rescue mode, marker-file power control)",
+    "shell": "poler-engine v0.61.0 Terminal Gateway (PRIMARY console shell: double execution contour, pipes, redirects, native retrieval — official release binary from poler-engine-org/poler-engine, sha256-pinned)",
+    "fallback_shell": "poler-sh v0.2.0 (rescue/compat shell from Kotokvit/poler-sh; /etc/passwd root shell; forced via poler.rescue=1)",
+    "power": "poler-powerctl v0.3.0 (sovereign reboot/poweroff/halt: marker IPC to PID 1 — works from inside the engine gateway)",
     "archive": "poler v0.1.0 (FastCDC + BLAKE3 streaming deduplication, from Kotokvit/poler)",
     "box": "poler-box (kernel sandbox & seccomp isolation, from Kotokvit/poler)",
     "fuse": "poler-fuse (zero-overhead VFS mounter, from Kotokvit/poler)",
-    "updater": "poler-update v1.1.0 (native Rust: curl transport, sha256 verify, atomic install)"
+    "updater": "poler-update v1.2.0 (native Rust: curl transport, sha256 verify, atomic install, sovereign engine channel --install engine)"
   },
   "optional_modules": {
-    "engine": "poler-engine v0.61.0 (Quantum, MCP, Living Voice, 3D Rasterizer) — installable via poler-update",
-    "mesh": "poler-mesh (Sovereign Node Mesh Hub)",
-    "git": "poler-git (Unified Git Engine)",
-    "edit": "poler-edit (Sovereign Text/Code Editor)"
+    "mesh": "poler-mesh (Sovereign Node Mesh Hub) — planned",
+    "git": "poler-git (Unified Git Engine) — planned",
+    "edit": "poler-edit (Sovereign Text/Code Editor) — planned"
+  },
+  "engine_channel": {
+    "engine": "poler-engine v0.61.0 — installable on ANY system via: poler-update --install engine (official release binary, sha256-pinned)",
+    "repository": "https://github.com/poler-engine-org/poler-engine"
+  },
+  "rescue": {
+    "kernel_cmdline": "poler.rescue=1",
+    "grub_entry": "POLER Sovereign Rescue (poler-sh console, engine bypassed)",
+    "purpose": "guaranteed console access even if the engine gateway cannot start"
   },
   "legacy_purged": [
-    "/bin/bash (no ELF in image; symlink -> poler-sh)",
+    "/bin/bash (no ELF in image)",
     "/usr/bin/bash (symlink -> poler-sh)",
     "/bin/sh (symlink -> poler-sh)",
     "systemd (PID 1 replaced by poler-init)",
@@ -35,6 +45,7 @@
     "core_asset": "poler-core-x86_64.tar.gz"
   },
   "source_repositories": {
+    "engine": "https://github.com/poler-engine-org/poler-engine",
     "shell": "https://github.com/Kotokvit/poler-sh",
     "archive": "https://github.com/Kotokvit/poler",
     "distro": "https://github.com/Kotokvit/poler-distro"

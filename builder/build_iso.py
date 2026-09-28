@@ -9,22 +9,27 @@ Pipeline (requires root; designed for GitHub Actions ubuntu-latest):
      (linux-cachyos kernel, core userland, curl for updates).
   3. PURGE legacy: bash, systemd, SysVinit glue, mkinitcpio, pacman itself —
      the sovereign image carries zero legacy shell/PID-1 glue.
-  4. Inject the POLER sovereign stack (built from source by CI):
-       poler-init (PID 1), poler-sh (shell), poler, poler-box, poler-fuse,
-       poler-update, /bin/sh + /bin/bash symlinks -> poler-sh,
-       /etc/passwd root shell -> poler-sh, /sbin/init -> poler-init.
-  5. Write /etc/os-release (POLER CachyOS Sovereign Edition) and
+  4. Fetch the official poler-engine release (sha256-pinned) — its Terminal
+     Gateway is the PRIMARY interactive shell of the live system.
+  5. Inject the POLER sovereign stack:
+       poler-init (PID 1) + poler-powerctl (reboot/poweroff marker IPC),
+       poler-engine (primary terminal: poler-engine --gateway, cwd=/),
+       poler-sh (rescue shell + #!/bin/sh compat layer), poler, poler-box,
+       poler-fuse, poler-update, /sbin/init -> poler-init,
+       /usr/bin/{reboot,poweroff,halt} -> poler-powerctl.
+  6. Write /etc/os-release (POLER CachyOS Sovereign Edition) and
      /poler/VERIFICATION.txt with the full build proof.
-  6. mksquashfs the rootfs -> /poler/live.squashfs.
-  7. Build poler-initramfs.cpio.gz: poler-init /init + kernel modules needed
+  7. mksquashfs the rootfs -> /poler/live.squashfs.
+  8. Build poler-initramfs.cpio.gz: poler-init /init + kernel modules needed
      to reach the medium (iso9660/sr_mod/ata_piix/ahci/usb/squashfs/loop)
      + zstd/xz fallback decompressors with their shared libs.
-  8. grub-mkrescue -> hybrid BIOS+UEFI ISO (xorriso).
-  9. QEMU smoke boot (--qemu): boots the ISO, asserts the sovereign chain
-     (poler-init stage 1 -> stage 2 -> poler-sh) on the serial console.
+  9. grub-mkrescue -> hybrid BIOS+UEFI ISO (xorriso).
+ 10. QEMU smoke boot (--qemu): boots the ISO, asserts the sovereign chain
+     (poler-init stage 1 -> stage 2 -> poler-engine Terminal Gateway) on the
+     serial console.
 
 Usage:
-  sudo python3 builder/build_iso.py [--version 1.1.0] [--qemu] [--keep-work]
+  sudo python3 builder/build_iso.py [--version 1.2.0] [--qemu] [--keep-work]
 """
 
 import argparse
@@ -69,15 +74,29 @@ PURGE_PKGS = [
 
 # POLER stack binaries (built by CI into binaries/).
 # poler-box / poler-fuse are optional (best-effort); the rest are required.
+# poler-engine is NOT built here — it is the official release binary of the
+# sovereign search-analytical engine (poler-engine-org/poler-engine) whose
+# Terminal Gateway is the PRIMARY console shell of this distro; the builder
+# downloads and sha256-verifies it automatically (ENGINE_* below).
 POLER_BINARIES = {
     "poler-init":  "/usr/bin/poler-init",
+    "poler-powerctl": "/usr/bin/poler-powerctl",
     "poler-sh":    "/usr/bin/poler-sh",
+    "poler-engine": "/usr/bin/poler-engine",
     "poler":       "/usr/bin/poler",
     "poler-box":   "/usr/bin/poler-box",
     "poler-fuse":  "/usr/bin/poler-fuse",
     "poler-update": "/usr/bin/poler-update",
 }
 OPTIONAL_BINARIES = {"poler-box", "poler-fuse"}
+
+# Sovereign engine — official release artifact, sha256-pinned. The Terminal
+# Gateway (poler-engine --gateway) is the interactive shell of the live ISO;
+# poler-sh stays as the rescue shell and the #!/bin/sh compatibility layer.
+ENGINE_VERSION = "0.61.0"
+ENGINE_URL = ("https://github.com/poler-engine-org/poler-engine/releases/"
+              f"download/v{ENGINE_VERSION}/poler-engine")
+ENGINE_SHA256 = "abd6e98b47b6282e929a6ddd6e7172c76c88e10ec5d45dce0d88a0388117b547"
 
 # Kernel modules the initramfs must carry to reach the boot medium.
 # NOTE: real module names as found in modules.dep ("isofs" is the module
@@ -266,9 +285,15 @@ def stage_purge_legacy(rootfs):
         if not os.path.lexists(linkpath):
             os.symlink("usr/bin", linkpath)
 
-    # Sovereign wiring: shell + PID 1.
+    # Sovereign wiring: shell + PID 1 + power control.
+    # /bin/sh + /bin/bash -> poler-sh: the #!/bin/sh compatibility layer
+    # (script shebangs); the INTERACTIVE shell of the live system is the
+    # poler-engine Terminal Gateway supervised by poler-init on the consoles.
     for link, target in [("usr/bin/sh", "poler-sh"),
-                         ("usr/bin/bash", "poler-sh")]:
+                         ("usr/bin/bash", "poler-sh"),
+                         ("usr/bin/reboot", "poler-powerctl"),
+                         ("usr/bin/poweroff", "poler-powerctl"),
+                         ("usr/bin/halt", "poler-powerctl")]:
         lp = os.path.join(rootfs, link)
         if os.path.lexists(lp):
             os.remove(lp)
@@ -282,7 +307,30 @@ def stage_purge_legacy(rootfs):
         os.remove(init_link)
     os.symlink("poler-init", init_link)
 
-    ok("legacy purged: /bin/sh, /bin/bash -> poler-sh; /sbin/init (=usr/bin/init) -> poler-init")
+    ok("legacy purged: /bin/sh, /bin/bash -> poler-sh (compat layer); "
+       "/sbin/init (=usr/bin/init) -> poler-init; reboot/poweroff/halt -> poler-powerctl")
+
+
+def stage_fetch_engine(bins_dir):
+    """Fetch and verify the sovereign engine release binary.
+
+    The engine is the crown jewel of the distro — its Terminal Gateway
+    (double execution contour: engine-native + sandboxed host proxy, pipes,
+    redirects, Linux/Windows command dictionary) is the interactive shell.
+    We always verify the pinned sha256, even when the file is pre-seeded
+    (e.g. by CI), so the supply chain stays sovereign end-to-end.
+    """
+    log(f"sovereign engine: fetching official release v{ENGINE_VERSION}...")
+    eng = os.path.join(bins_dir, "poler-engine")
+    if not os.path.exists(eng):
+        sh(f"curl -fL --retry 3 -o '{eng}' '{ENGINE_URL}'")
+    digest = sha256_file(eng)
+    if digest != ENGINE_SHA256:
+        die(f"poler-engine sha256 mismatch: got {digest}, pinned {ENGINE_SHA256} — "
+            f"refusing to build a distro around an unverified engine")
+    os.chmod(eng, 0o755)
+    ok(f"poler-engine v{ENGINE_VERSION} verified ({os.path.getsize(eng) / 1e6:.1f} MB, sha256 OK)")
+    return eng
 
 
 def stage_inject_poler(rootfs, bins_dir):
@@ -327,6 +375,24 @@ def stage_inject_poler(rootfs, bins_dir):
     os.makedirs(os.path.join(rootfs, "etc"), exist_ok=True)
     open(os.path.join(rootfs, "etc/securetty"), "w").write(
         "console\ntty1\ntty2\ntty3\ntty4\nttyS0\n")
+
+    # The engine is dynamically linked against glibc (ld-linux + libc + libm
+    # + libgcc_s) — all present in the CachyOS base; verify, because a
+    # mismatched interpreter would kill every console session at boot.
+    # (Layout-tolerant: merged-usr vs classic placements.)
+    def rootfs_has(relpath):
+        return (os.path.exists(os.path.join(rootfs, relpath))
+                or os.path.islink(os.path.join(rootfs, relpath)))
+
+    for lib, alts in [
+        ("lib64/ld-linux-x86-64.so.2", ["usr/lib64/ld-linux-x86-64.so.2"]),
+        ("usr/lib/libc.so.6", ["lib/libc.so.6"]),
+        ("usr/lib/libm.so.6", ["lib/libm.so.6"]),
+        ("usr/lib/libgcc_s.so.1", ["lib/libgcc_s.so.1"]),
+    ]:
+        if not any(rootfs_has(p) for p in [lib] + alts):
+            die(f"engine dependency missing in rootfs: /{lib} — glibc base incomplete")
+    ok("engine glibc dependencies present (ld-linux, libc, libm, libgcc_s)")
     ok("POLER stack injected")
 
 
@@ -342,7 +408,10 @@ SUPPORT_URL="https://github.com/Kotokvit/poler-distro"
 LOGO=poler
 
 POLER_INIT=1
-POLER_SHELL=/usr/bin/poler-sh
+POLER_SHELL=/usr/bin/poler-engine
+POLER_TERMINAL=gateway
+POLER_RESCUE_SHELL=/usr/bin/poler-sh
+POLER_ENGINE_VERSION={ENGINE_VERSION}
 BASH_PURGED=1
 SYSTEMD_PURGED=1
 UPSTREAM_KERNEL={KERNEL_PKG}
@@ -384,23 +453,37 @@ SOVEREIGN STACK
 ---------------
 {binaries}
 
+SHELL ARCHITECTURE
+------------------
+primary terminal    : poler-engine v{ENGINE_VERSION} Terminal Gateway
+                       (poler-engine --gateway; workspace root = /; double
+                       contour: engine-native + sandboxed host proxy; pipes,
+                       redirects, Linux/Windows command dictionary)
+source              : https://github.com/poler-engine-org/poler-engine
+sha256 (pinned)     : {ENGINE_SHA256}
+rescue shell        : poler-sh v0.2.0 (https://github.com/Kotokvit/poler-sh)
+                       — fallback console shell + #!/bin/sh compat layer
+power control       : poler-powerctl (/usr/bin/reboot, /usr/bin/poweroff,
+                       /usr/bin/halt) — marker IPC to poler-init PID 1
+
 LEGACY PURGE PROOF
 ------------------
-bash               : PURGED (no ELF present; /bin/bash + /usr/bin/bash are symlinks -> poler-sh)
+bash               : PURGED (no ELF present; /bin/bash + /usr/bin/bash are symlinks -> poler-sh compat layer)
 systemd            : PURGED (not installed; PID 1 = poler-init via /sbin/init)
 mkinitcpio         : PURGED (sovereign poler-initramfs instead)
 pacman             : PURGED (updates arrive via poler-update from GitHub only)
 SysVinit glue      : absent (no /etc/init.d, no rc.local)
-/bin/sh            : symlink -> poler-sh
+/bin/sh            : symlink -> poler-sh (script shebang compatibility)
 /sbin/init         : /usr/bin/init (merged usr layout) -> poler-init (PID 1)
-root shell         : /usr/bin/poler-sh (/etc/passwd)
+root shell         : /usr/bin/poler-sh (/etc/passwd; consoles run the engine gateway)
 
 BOOT CHAIN
 ----------
 GRUB (BIOS+UEFI) -> vmlinuz-cachyos + poler-initramfs.cpio.gz
   -> poler-init stage 1 (modules, medium scan, squashfs loop, switch_root)
-  -> poler-init stage 2 (console supervision, respawn, reboot/poweroff)
-  -> poler-sh sessions on /dev/console, tty2..tty4
+  -> poler-init stage 2 (tmpfs /run,/tmp,/root; console supervision; markers)
+  -> poler-engine --gateway sessions on /dev/console, tty2..tty4
+     (poler.rescue=1 on the kernel cmdline bypasses the engine -> poler-sh)
 
 UPDATE PATH
 -----------
@@ -648,7 +731,13 @@ def stage_qemu(iso_path, timeout_s=240):
         ("boot medium found", "boot medium:" in text),
         ("switch_root executed", "switch_root" in text),
         ("poler-init stage 2 (system)", "sovereign boot stage 2" in text),
-        ("poler-sh session supervised", "supervising" in text and "poler-sh session" in text),
+        ("terminal sessions supervised", "supervising" in text and "terminal session" in text),
+        ("poler-engine Terminal Gateway live on console",
+         # The engine itself prints "POLER Engine 0.61.0 — Terminal Gateway"
+         # on startup; poler-init's supervision log only says lowercase
+         # "poler-engine Terminal Gateway", so requiring the capitalized
+         # banner PROVES the engine binary actually spawned and ran.
+         "POLER Engine" in text and "Terminal Gateway" in text),
     ]
     failed = [name for name, passed in checks if not passed]
     for name, passed in checks:
@@ -656,7 +745,7 @@ def stage_qemu(iso_path, timeout_s=240):
         print(f"  [{mark}] {name}", flush=True)
     if failed:
         die(f"QEMU boot verification failed: {failed}")
-    ok("QEMU boot verification PASSED — sovereign chain reaches poler-sh")
+    ok("QEMU boot verification PASSED — sovereign chain reaches the poler-engine Terminal Gateway")
 
 
 # ---------------------------------------------------------------------- main --
@@ -687,7 +776,7 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--bins", default=None)
     ap.add_argument("--kernel", default=KERNEL_PKG)
-    ap.add_argument("--version", default="1.1.0")
+    ap.add_argument("--version", default="1.2.0")
     ap.add_argument("--qemu", action="store_true")
     args = ap.parse_args()
 
@@ -721,6 +810,7 @@ def main():
 
     # 3-5. purge, inject, identity, proof
     stage_purge_legacy(rootfs)
+    stage_fetch_engine(bins)
     stage_inject_poler(rootfs, bins)
     stage_os_release(rootfs, args.version)
     stage_verification(rootfs, args.version, kver)
